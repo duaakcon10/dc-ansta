@@ -14,13 +14,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev
       - name: Build static
         run: |
-          gcc -O3 -std=c11 -pthread -static -static-libgcc -static-libstdc++ \
+          gcc -O3 -std=gnu11 -pthread -static -static-libgcc -static-libstdc++ \
             -march=x86-64 -mtune=generic -flto -DNDEBUG \
             src/bot.c -o bot_static -lssl -lcrypto -lz -ldl -lpthread
           strip bot_static
       - name: Build dynamic
         run: |
-          gcc -O3 -std=c11 -pthread -march=native -mtune=native \
+          gcc -O3 -std=gnu11 -pthread -march=native -mtune=native \
             -flto -ffast-math -funroll-loops -DNDEBUG \
             src/bot.c -o bot -lssl -lcrypto -lz -ldl
           strip bot
