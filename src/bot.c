@@ -295,6 +295,17 @@ static void *mega_worker(void *arg)
     return NULL;
 }
 
+static void udp_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+static void syn_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+static void tcp_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+static void http_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+static void slowloris(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+static void tls_exhaust(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+static void dns_amp(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+static void game_mimic(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+static void icmp_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+static void mixed(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+
 struct stop_ctx { int dur; volatile int *running; };
 
 static void *stop_timer(void *arg)
