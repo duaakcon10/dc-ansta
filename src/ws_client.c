@@ -132,8 +132,9 @@ int ws_connect(WS *ws, const char *bot_id)
         return -1;
     }
 
-    /* After handshake, use longer/no timeout for idle heartbeats */
-    struct timeval tv2 = {30, 0};
+    /* After handshake, short poll so heartbeat fires on schedule (10s)
+       and we don't block 30s missing heartbeat timing. */
+    struct timeval tv2 = {3, 0};
     setsockopt(ws->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
     return 0;
 }
