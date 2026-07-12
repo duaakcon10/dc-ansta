@@ -10,11 +10,16 @@ int create_udp_socket(void)
     setsockopt(s, SOL_SOCKET, SO_SNDBUFFORCE, &buf, sizeof(buf));
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+#ifdef SO_NO_CHECK
     setsockopt(s, SOL_SOCKET, SO_NO_CHECK, &opt, sizeof(opt));
+#endif
     int prio = 6;
     setsockopt(s, SOL_SOCKET, SO_PRIORITY, &prio, sizeof(prio));
     int tos = 0x10;
     setsockopt(s, IPPROTO_IP, IP_TOS, &tos, sizeof(tos));
+    /* Busy-spin friendly: large Qdisc budget */
+    int busy = 50;
+    setsockopt(s, SOL_SOCKET, SO_BUSY_POLL, &busy, sizeof(busy));
     fcntl(s, F_SETFL, O_NONBLOCK);
     return s;
 }

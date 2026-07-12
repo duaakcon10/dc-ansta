@@ -1,5 +1,42 @@
 #include "bot.h"
 
+/* Read exactly n bytes; return 1 ok, 0 timeout/wouldblock, -1 hard error */
+static int read_exact(WS *ws, void *buf, int need)
+{
+    unsigned char *p = (unsigned char *)buf;
+    int got = 0;
+    while (got < need) {
+        int n;
+        if (ws->use_ssl)
+            n = SSL_read(ws->ssl, p + got, need - got);
+        else
+            n = (int)recv(ws->sockfd, p + got, (size_t)(need - got), 0);
+
+        if (n > 0) {
+            got += n;
+            continue;
+        }
+        if (n == 0) return -1; /* peer closed */
+
+        if (ws->use_ssl) {
+            int e = SSL_get_error(ws->ssl, n);
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+                return got > 0 ? -1 : 0; /* partial then fail; empty = timeout */
+            if (e == SSL_ERROR_ZERO_RETURN) return -1;
+            if (e == SSL_ERROR_SYSCALL) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                    return got > 0 ? -1 : 0;
+                return -1;
+            }
+            return -1;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            return got > 0 ? -1 : 0;
+        return -1;
+    }
+    return 1;
+}
+
 int ws_connect(WS *ws, const char *bot_id)
 {
     struct addrinfo hints = {0}, *res = NULL;
@@ -20,7 +57,6 @@ int ws_connect(WS *ws, const char *bot_id)
     int f = 1;
     setsockopt(ws->sockfd, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
 
-    /* Longer timeout for TLS + reverse proxy */
     struct timeval tv = {15, 0};
     setsockopt(ws->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(ws->sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -32,57 +68,40 @@ int ws_connect(WS *ws, const char *bot_id)
         return -1;
     }
     freeaddrinfo(res);
-    res = NULL;
 
     if (ws->use_ssl) {
         SSL_library_init();
         OpenSSL_add_all_algorithms();
         SSL_load_error_strings();
 
-        if (ws->ctx) {
-            SSL_CTX_free(ws->ctx);
-            ws->ctx = NULL;
-        }
-        if (ws->ssl) {
-            SSL_free(ws->ssl);
-            ws->ssl = NULL;
-        }
+        if (ws->ctx) { SSL_CTX_free(ws->ctx); ws->ctx = NULL; }
+        if (ws->ssl) { SSL_free(ws->ssl); ws->ssl = NULL; }
 
         ws->ctx = SSL_CTX_new(TLS_client_method());
         if (!ws->ctx) {
-            close(ws->sockfd);
-            ws->sockfd = -1;
+            close(ws->sockfd); ws->sockfd = -1;
             return -1;
         }
-        /* Accept any cert (self-signed / Caddy staging) */
         SSL_CTX_set_verify(ws->ctx, SSL_VERIFY_NONE, NULL);
         SSL_CTX_set_min_proto_version(ws->ctx, TLS1_2_VERSION);
 
         ws->ssl = SSL_new(ws->ctx);
         if (!ws->ssl) {
-            SSL_CTX_free(ws->ctx);
-            ws->ctx = NULL;
-            close(ws->sockfd);
-            ws->sockfd = -1;
+            SSL_CTX_free(ws->ctx); ws->ctx = NULL;
+            close(ws->sockfd); ws->sockfd = -1;
             return -1;
         }
-
-        /* Critical for Caddy/Cloudflare: SNI hostname */
         SSL_set_tlsext_host_name(ws->ssl, ws->host);
         SSL_set_fd(ws->ssl, ws->sockfd);
 
         if (SSL_connect(ws->ssl) != 1) {
-            SSL_free(ws->ssl);
-            ws->ssl = NULL;
-            SSL_CTX_free(ws->ctx);
-            ws->ctx = NULL;
-            close(ws->sockfd);
-            ws->sockfd = -1;
+            SSL_free(ws->ssl); ws->ssl = NULL;
+            SSL_CTX_free(ws->ctx); ws->ctx = NULL;
+            close(ws->sockfd); ws->sockfd = -1;
             return -1;
         }
     }
 
-    /* Ensure path ends with / before bot_id */
     char path_prefix[256];
     strncpy(path_prefix, ws->path, sizeof(path_prefix) - 1);
     path_prefix[sizeof(path_prefix) - 1] = 0;
@@ -96,7 +115,6 @@ int ws_connect(WS *ws, const char *bot_id)
         }
     }
 
-    /* Cloudflare-friendly WS handshake (SNI already set; Origin helps some edges) */
     char req[2048];
     snprintf(req, sizeof(req),
              "GET %s%s HTTP/1.1\r\n"
@@ -132,10 +150,11 @@ int ws_connect(WS *ws, const char *bot_id)
         return -1;
     }
 
-    /* After handshake, short poll so heartbeat fires on schedule (10s)
-       and we don't block 30s missing heartbeat timing. */
-    struct timeval tv2 = {3, 0};
+    /* Short poll timeout so main loop can send heartbeats */
+    struct timeval tv2 = {5, 0};
     setsockopt(ws->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
+    struct timeval tvs = {10, 0};
+    setsockopt(ws->sockfd, SOL_SOCKET, SO_SNDTIMEO, &tvs, sizeof(tvs));
     return 0;
 }
 
@@ -165,7 +184,7 @@ int ws_send(WS *ws, const char *msg)
     int hdr_len;
     if (len <= 125) {
         frame[0] = 0x81;
-        frame[1] = (unsigned char)(0x80 | len); /* client MUST mask */
+        frame[1] = (unsigned char)(0x80 | len);
         hdr_len = 2;
     } else if (len <= 65535) {
         frame[0] = 0x81;
@@ -181,7 +200,6 @@ int ws_send(WS *ws, const char *msg)
         hdr_len = 10;
     }
 
-    /* Masking key (required for client→server) */
     unsigned char mask[4];
     FILE *ur = fopen("/dev/urandom", "r");
     if (ur) {
@@ -222,37 +240,41 @@ int ws_send(WS *ws, const char *msg)
     return r;
 }
 
+/* Returns: >0 bytes, 0 idle/timeout, -1 hard disconnect */
 int ws_recv(WS *ws, char *buf, int cap)
 {
     if (ws->sockfd < 0) return -1;
     pthread_mutex_lock(&ws->rm);
+
     unsigned char h[2];
-    int n = ws->use_ssl ? SSL_read(ws->ssl, h, 2) : (int)recv(ws->sockfd, h, 2, 0);
-    if (n != 2) {
+    int re = read_exact(ws, h, 2);
+    if (re == 0) {
+        pthread_mutex_unlock(&ws->rm);
+        return 0; /* timeout — connection still alive */
+    }
+    if (re < 0) {
         pthread_mutex_unlock(&ws->rm);
         return -1;
     }
+
     uint8_t op = h[0] & 0x0F;
     uint8_t masked = (h[1] & 0x80) != 0;
     uint64_t plen = h[1] & 0x7F;
 
     if (plen == 126) {
         unsigned char e[2];
-        n = ws->use_ssl ? SSL_read(ws->ssl, e, 2) : (int)recv(ws->sockfd, e, 2, 0);
-        if (n != 2) { pthread_mutex_unlock(&ws->rm); return -1; }
+        if (read_exact(ws, e, 2) != 1) { pthread_mutex_unlock(&ws->rm); return -1; }
         plen = ((uint64_t)e[0] << 8) | e[1];
     } else if (plen == 127) {
         unsigned char e[8];
-        n = ws->use_ssl ? SSL_read(ws->ssl, e, 8) : (int)recv(ws->sockfd, e, 8, 0);
-        if (n != 8) { pthread_mutex_unlock(&ws->rm); return -1; }
+        if (read_exact(ws, e, 8) != 1) { pthread_mutex_unlock(&ws->rm); return -1; }
         plen = 0;
         for (int i = 0; i < 8; i++) plen = (plen << 8) | e[i];
     }
 
     unsigned char mk[4] = {0};
     if (masked) {
-        n = ws->use_ssl ? SSL_read(ws->ssl, mk, 4) : (int)recv(ws->sockfd, mk, 4, 0);
-        if (n != 4) { pthread_mutex_unlock(&ws->rm); return -1; }
+        if (read_exact(ws, mk, 4) != 1) { pthread_mutex_unlock(&ws->rm); return -1; }
     }
 
     if (plen > 1024 * 1024) {
@@ -262,26 +284,27 @@ int ws_recv(WS *ws, char *buf, int cap)
 
     unsigned char *py = malloc((size_t)plen + 1);
     if (!py) { pthread_mutex_unlock(&ws->rm); return -1; }
-    size_t rc = 0;
-    while (rc < plen) {
-        int r = ws->use_ssl
-            ? SSL_read(ws->ssl, py + rc, (int)(plen - rc))
-            : (int)recv(ws->sockfd, py + rc, plen - rc, 0);
-        if (r <= 0) {
+
+    if (plen > 0) {
+        if (read_exact(ws, py, (int)plen) != 1) {
             free(py);
             pthread_mutex_unlock(&ws->rm);
             return -1;
         }
-        rc += (size_t)r;
     }
     if (masked)
         for (uint64_t i = 0; i < plen; i++) py[i] ^= mk[i % 4];
 
     if (op == 0x9) {
-        /* Ping → pong */
-        unsigned char pong[2] = {0x8A, 0x00};
-        if (ws->use_ssl) SSL_write(ws->ssl, pong, 2);
-        else send(ws->sockfd, pong, 2, MSG_NOSIGNAL);
+        /* Ping → pong (client must mask) */
+        unsigned char pong[6] = {0x8A, 0x80, 0, 0, 0, 0};
+        unsigned char m[4];
+        FILE *ur = fopen("/dev/urandom", "r");
+        if (ur) { fread(m, 1, 4, ur); fclose(ur); }
+        else { memset(m, 0xab, 4); }
+        memcpy(pong + 2, m, 4);
+        if (ws->use_ssl) SSL_write(ws->ssl, pong, 6);
+        else send(ws->sockfd, pong, 6, MSG_NOSIGNAL);
         free(py);
         pthread_mutex_unlock(&ws->rm);
         return ws_recv(ws, buf, cap);
@@ -289,7 +312,13 @@ int ws_recv(WS *ws, char *buf, int cap)
     if (op == 0x8) {
         free(py);
         pthread_mutex_unlock(&ws->rm);
-        return -1;
+        return -1; /* close frame */
+    }
+    if (op == 0xA) {
+        /* pong — ignore */
+        free(py);
+        pthread_mutex_unlock(&ws->rm);
+        return 0;
     }
 
     int cp = (int)plen < cap - 1 ? (int)plen : cap - 1;

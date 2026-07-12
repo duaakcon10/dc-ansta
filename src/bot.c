@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.6"
+#define BOT_VERSION_TAG "v4.0.9"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -231,11 +231,19 @@ int main(int argc, char *argv[])
 
             char buf[4096];
             int n = ws_recv(&ws, buf, sizeof(buf));
+            if (n == 0) {
+                /* Idle timeout — connection still OK. Only stale if no frame forever. */
+                if (time(NULL) - last_recv > (time_t)cfg.stale_timeout) {
+                    if (foreground) fprintf(stderr, "[bot] stale timeout, reconnect\n");
+                    break;
+                }
+                continue;
+            }
             if (n < 0) {
                 recv_fail++;
-                if (recv_fail >= 4) break;
-                if (time(NULL) - last_recv > (time_t)cfg.stale_timeout) break;
-                usleep(200000);
+                if (foreground) fprintf(stderr, "[bot] recv hard error #%d\n", recv_fail);
+                if (recv_fail >= 2) break; /* real disconnect */
+                usleep(100000);
                 continue;
             }
             last_recv = time(NULL);
