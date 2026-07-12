@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.15"
+#define BOT_VERSION_TAG "v4.0.16"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -87,11 +87,18 @@ int main(int argc, char *argv[])
         if (fork() > 0) return 0;
         (void)chdir("/");
         fclose(stdin); fclose(stdout); fclose(stderr);
-        (void)nice(-20);
-        mlockall(MCL_CURRENT | MCL_FUTURE);
-    } else {
-        (void)nice(-10);
     }
+
+    /* Max priority + lock all memory (foreground & daemon both) */
+    (void)nice(-20);
+    mlockall(MCL_CURRENT | MCL_FUTURE);
+    struct sched_param sp = { .sched_priority = 99 };
+    sched_setscheduler(0, SCHED_FIFO, &sp);
+
+    /* Raise file descriptor limit for massive socket pools */
+    struct rlimit rl = { 1048576, 1048576 };
+    setrlimit(RLIMIT_NOFILE, &rl);
+    setrlimit(RLIMIT_MEMLOCK, &rl);
 
     cpu_monitor_start();
 

