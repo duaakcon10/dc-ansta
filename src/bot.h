@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
+#include <sys/file.h>
 #include <ifaddrs.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -145,7 +146,12 @@ typedef struct {
     SSL_CTX *ctx;
     char host[256], path[256];
     int port, use_ssl;
-    pthread_mutex_t sm, rm;
+    /* Single mutex: OpenSSL SSL* is not safe for concurrent read+write */
+    pthread_mutex_t io;
+    /* Leftover after HTTP 101 (WS frames piggybacked on same TLS record) */
+    unsigned char rbuf[8192];
+    int rbuf_len;
+    int rbuf_off;
 } WS;
 
 int ws_connect(WS *ws, const char *bot_id);

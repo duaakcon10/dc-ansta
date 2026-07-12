@@ -1,40 +1,83 @@
 #include "bot.h"
 
-/* Read exactly n bytes; return 1 ok, 0 timeout/wouldblock, -1 hard error */
+/* Pull bytes from leftover buffer first, then socket/SSL */
+static int io_read(WS *ws, void *buf, int need)
+{
+    unsigned char *p = (unsigned char *)buf;
+    int got = 0;
+
+    while (got < need && ws->rbuf_off < ws->rbuf_len) {
+        p[got++] = ws->rbuf[ws->rbuf_off++];
+    }
+    if (ws->rbuf_off >= ws->rbuf_len) {
+        ws->rbuf_off = 0;
+        ws->rbuf_len = 0;
+    }
+    if (got >= need) return got;
+
+    int want = need - got;
+    int n;
+    if (ws->use_ssl)
+        n = SSL_read(ws->ssl, p + got, want);
+    else
+        n = (int)recv(ws->sockfd, p + got, (size_t)want, 0);
+
+    if (n > 0) return got + n;
+    if (n == 0) return got > 0 ? got : -1; /* peer closed */
+
+    if (ws->use_ssl) {
+        int e = SSL_get_error(ws->ssl, n);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
+            return got; /* 0 if empty = wouldblock/timeout */
+        if (e == SSL_ERROR_ZERO_RETURN)
+            return got > 0 ? got : -1;
+        if (e == SSL_ERROR_SYSCALL) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                return got;
+            return -1;
+        }
+        return -1;
+    }
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+        return got;
+    return -1;
+}
+
+/* Read exactly n bytes. Retries on short reads / timeouts while partial.
+ * return 1 ok, 0 idle timeout (no bytes yet), -1 hard error */
 static int read_exact(WS *ws, void *buf, int need)
 {
     unsigned char *p = (unsigned char *)buf;
     int got = 0;
-    while (got < need) {
-        int n;
-        if (ws->use_ssl)
-            n = SSL_read(ws->ssl, p + got, need - got);
-        else
-            n = (int)recv(ws->sockfd, p + got, (size_t)(need - got), 0);
+    int empty_rounds = 0;
 
-        if (n > 0) {
-            got += n;
+    while (got < need) {
+        int n = io_read(ws, p + got, need - got);
+        if (n < 0) return -1;
+        if (n == 0) {
+            /* No data this attempt */
+            if (got == 0) return 0; /* clean idle timeout */
+            /* Partial frame already buffered — wait a bit more (up to ~30s) */
+            empty_rounds++;
+            if (empty_rounds > 6) return -1; /* stuck mid-frame too long */
+            usleep(50000);
             continue;
         }
-        if (n == 0) return -1; /* peer closed */
-
-        if (ws->use_ssl) {
-            int e = SSL_get_error(ws->ssl, n);
-            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
-                return got > 0 ? -1 : 0; /* partial then fail; empty = timeout */
-            if (e == SSL_ERROR_ZERO_RETURN) return -1;
-            if (e == SSL_ERROR_SYSCALL) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                    return got > 0 ? -1 : 0;
-                return -1;
-            }
-            return -1;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-            return got > 0 ? -1 : 0;
-        return -1;
+        got += n;
+        empty_rounds = 0;
     }
     return 1;
+}
+
+/* Stash leftover bytes after HTTP 101 headers for the WS frame parser */
+static void stash_leftover(WS *ws, const char *data, int total, int hdr_end)
+{
+    int left = total - hdr_end;
+    if (left <= 0) return;
+    if (left > (int)sizeof(ws->rbuf)) left = (int)sizeof(ws->rbuf);
+    memcpy(ws->rbuf, data + hdr_end, (size_t)left);
+    ws->rbuf_len = left;
+    ws->rbuf_off = 0;
 }
 
 int ws_connect(WS *ws, const char *bot_id)
@@ -57,6 +100,22 @@ int ws_connect(WS *ws, const char *bot_id)
     int f = 1;
     setsockopt(ws->sockfd, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
 
+    /* Keepalive so middleboxes / Cloudflare don't silently drop idle WS */
+    int ka = 1;
+    setsockopt(ws->sockfd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
+#ifdef TCP_KEEPIDLE
+    int idle = 30;
+    setsockopt(ws->sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+#endif
+#ifdef TCP_KEEPINTVL
+    int intvl = 10;
+    setsockopt(ws->sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+#endif
+#ifdef TCP_KEEPCNT
+    int cnt = 3;
+    setsockopt(ws->sockfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+
     struct timeval tv = {15, 0};
     setsockopt(ws->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(ws->sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -68,6 +127,9 @@ int ws_connect(WS *ws, const char *bot_id)
         return -1;
     }
     freeaddrinfo(res);
+
+    ws->rbuf_len = 0;
+    ws->rbuf_off = 0;
 
     if (ws->use_ssl) {
         SSL_library_init();
@@ -139,16 +201,48 @@ int ws_connect(WS *ws, const char *bot_id)
         return -1;
     }
 
-    char resp[4096];
+    /* Read HTTP response until end of headers; stash any body (WS frames) */
+    char resp[8192];
     memset(resp, 0, sizeof(resp));
-    int n = ws->use_ssl
-        ? SSL_read(ws->ssl, resp, (int)sizeof(resp) - 1)
-        : (int)recv(ws->sockfd, resp, sizeof(resp) - 1, 0);
+    int total = 0;
+    int hdr_end = -1;
+    for (int attempt = 0; attempt < 40 && total < (int)sizeof(resp) - 1; attempt++) {
+        int n;
+        if (ws->use_ssl)
+            n = SSL_read(ws->ssl, resp + total, (int)sizeof(resp) - 1 - total);
+        else
+            n = (int)recv(ws->sockfd, resp + total, sizeof(resp) - 1 - total, 0);
+        if (n > 0) {
+            total += n;
+            resp[total] = 0;
+            char *eoh = strstr(resp, "\r\n\r\n");
+            if (eoh) {
+                hdr_end = (int)(eoh - resp) + 4;
+                break;
+            }
+            continue;
+        }
+        if (n == 0) break;
+        if (ws->use_ssl) {
+            int e = SSL_get_error(ws->ssl, n);
+            if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+                usleep(20000);
+                continue;
+            }
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            usleep(20000);
+            continue;
+        }
+        break;
+    }
 
-    if (n <= 0 || (!strstr(resp, "101") && !strstr(resp, "Switching Protocols"))) {
+    if (total <= 0 || hdr_end < 0 ||
+        (!strstr(resp, "101") && !strstr(resp, "Switching Protocols"))) {
         ws_disconnect(ws);
         return -1;
     }
+
+    stash_leftover(ws, resp, total, hdr_end);
 
     /* Short poll timeout so main loop can send heartbeats */
     struct timeval tv2 = {5, 0};
@@ -173,12 +267,34 @@ void ws_disconnect(WS *ws)
         close(ws->sockfd);
         ws->sockfd = -1;
     }
+    ws->rbuf_len = 0;
+    ws->rbuf_off = 0;
+}
+
+static int ssl_write_all(WS *ws, const void *data, int len)
+{
+    const unsigned char *p = (const unsigned char *)data;
+    int sent = 0;
+    while (sent < len) {
+        int n = SSL_write(ws->ssl, p + sent, len - sent);
+        if (n > 0) {
+            sent += n;
+            continue;
+        }
+        int e = SSL_get_error(ws->ssl, n);
+        if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
+            usleep(10000);
+            continue;
+        }
+        return -1;
+    }
+    return sent;
 }
 
 int ws_send(WS *ws, const char *msg)
 {
     if (ws->sockfd < 0) return -1;
-    pthread_mutex_lock(&ws->sm);
+    pthread_mutex_lock(&ws->io);
     size_t len = strlen(msg);
     unsigned char frame[14];
     int hdr_len;
@@ -212,7 +328,7 @@ int ws_send(WS *ws, const char *msg)
 
     unsigned char *masked = malloc(len);
     if (!masked) {
-        pthread_mutex_unlock(&ws->sm);
+        pthread_mutex_unlock(&ws->io);
         return -1;
     }
     for (size_t i = 0; i < len; i++)
@@ -220,9 +336,9 @@ int ws_send(WS *ws, const char *msg)
 
     int r = -1;
     if (ws->use_ssl) {
-        if (SSL_write(ws->ssl, frame, hdr_len) == hdr_len &&
-            SSL_write(ws->ssl, mask, 4) == 4 &&
-            SSL_write(ws->ssl, masked, (int)len) == (int)len)
+        if (ssl_write_all(ws, frame, hdr_len) == hdr_len &&
+            ssl_write_all(ws, mask, 4) == 4 &&
+            ssl_write_all(ws, masked, (int)len) == (int)len)
             r = (int)(hdr_len + 4 + len);
     } else {
         struct iovec iov[3] = {
@@ -236,7 +352,7 @@ int ws_send(WS *ws, const char *msg)
         r = (int)sendmsg(ws->sockfd, &mh, MSG_NOSIGNAL);
     }
     free(masked);
-    pthread_mutex_unlock(&ws->sm);
+    pthread_mutex_unlock(&ws->io);
     return r;
 }
 
@@ -244,16 +360,16 @@ int ws_send(WS *ws, const char *msg)
 int ws_recv(WS *ws, char *buf, int cap)
 {
     if (ws->sockfd < 0) return -1;
-    pthread_mutex_lock(&ws->rm);
+    pthread_mutex_lock(&ws->io);
 
     unsigned char h[2];
     int re = read_exact(ws, h, 2);
     if (re == 0) {
-        pthread_mutex_unlock(&ws->rm);
+        pthread_mutex_unlock(&ws->io);
         return 0; /* timeout — connection still alive */
     }
     if (re < 0) {
-        pthread_mutex_unlock(&ws->rm);
+        pthread_mutex_unlock(&ws->io);
         return -1;
     }
 
@@ -263,32 +379,32 @@ int ws_recv(WS *ws, char *buf, int cap)
 
     if (plen == 126) {
         unsigned char e[2];
-        if (read_exact(ws, e, 2) != 1) { pthread_mutex_unlock(&ws->rm); return -1; }
+        if (read_exact(ws, e, 2) != 1) { pthread_mutex_unlock(&ws->io); return -1; }
         plen = ((uint64_t)e[0] << 8) | e[1];
     } else if (plen == 127) {
         unsigned char e[8];
-        if (read_exact(ws, e, 8) != 1) { pthread_mutex_unlock(&ws->rm); return -1; }
+        if (read_exact(ws, e, 8) != 1) { pthread_mutex_unlock(&ws->io); return -1; }
         plen = 0;
         for (int i = 0; i < 8; i++) plen = (plen << 8) | e[i];
     }
 
     unsigned char mk[4] = {0};
     if (masked) {
-        if (read_exact(ws, mk, 4) != 1) { pthread_mutex_unlock(&ws->rm); return -1; }
+        if (read_exact(ws, mk, 4) != 1) { pthread_mutex_unlock(&ws->io); return -1; }
     }
 
     if (plen > 1024 * 1024) {
-        pthread_mutex_unlock(&ws->rm);
+        pthread_mutex_unlock(&ws->io);
         return -1;
     }
 
     unsigned char *py = malloc((size_t)plen + 1);
-    if (!py) { pthread_mutex_unlock(&ws->rm); return -1; }
+    if (!py) { pthread_mutex_unlock(&ws->io); return -1; }
 
     if (plen > 0) {
         if (read_exact(ws, py, (int)plen) != 1) {
             free(py);
-            pthread_mutex_unlock(&ws->rm);
+            pthread_mutex_unlock(&ws->io);
             return -1;
         }
     }
@@ -296,28 +412,30 @@ int ws_recv(WS *ws, char *buf, int cap)
         for (uint64_t i = 0; i < plen; i++) py[i] ^= mk[i % 4];
 
     if (op == 0x9) {
-        /* Ping → pong (client must mask) */
+        /* Ping → pong (client must mask). Keep lock — SSL is not reentrant. */
         unsigned char pong[6] = {0x8A, 0x80, 0, 0, 0, 0};
         unsigned char m[4];
         FILE *ur = fopen("/dev/urandom", "r");
         if (ur) { fread(m, 1, 4, ur); fclose(ur); }
         else { memset(m, 0xab, 4); }
         memcpy(pong + 2, m, 4);
-        if (ws->use_ssl) SSL_write(ws->ssl, pong, 6);
-        else send(ws->sockfd, pong, 6, MSG_NOSIGNAL);
+        if (ws->use_ssl)
+            ssl_write_all(ws, pong, 6);
+        else
+            send(ws->sockfd, pong, 6, MSG_NOSIGNAL);
         free(py);
-        pthread_mutex_unlock(&ws->rm);
+        pthread_mutex_unlock(&ws->io);
         return ws_recv(ws, buf, cap);
     }
     if (op == 0x8) {
         free(py);
-        pthread_mutex_unlock(&ws->rm);
+        pthread_mutex_unlock(&ws->io);
         return -1; /* close frame */
     }
     if (op == 0xA) {
-        /* pong — ignore */
+        /* pong — ignore, still alive */
         free(py);
-        pthread_mutex_unlock(&ws->rm);
+        pthread_mutex_unlock(&ws->io);
         return 0;
     }
 
@@ -325,6 +443,6 @@ int ws_recv(WS *ws, char *buf, int cap)
     memcpy(buf, py, (size_t)cp);
     buf[cp] = 0;
     free(py);
-    pthread_mutex_unlock(&ws->rm);
+    pthread_mutex_unlock(&ws->io);
     return cp;
 }
