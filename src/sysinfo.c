@@ -45,15 +45,21 @@ void sys_info(SysInfo *info)
     FILE *osrel = fopen("/etc/os-release", "r");
     if (osrel) {
         char line[256];
-        while (fgets(line, sizeof(line), osrel))
-            if (strstr(line, "PRETTY_NAME=")) {
-                char *s = strchr(line, '"') + 1;
-                char *e = strrchr(line, '"');
-                if (e) *e = 0;
-                strncpy(info->os_ver, s, sizeof(info->os_ver) - 1);
-            }
+        while (fgets(line, sizeof(line), osrel)) {
+            if (strncmp(line, "PRETTY_NAME=", 12) != 0) continue;
+            char *s = line + 12;
+            if (*s == '"') s++;
+            char *e = strrchr(s, '"');
+            if (e) *e = 0;
+            e = strchr(s, '\n');
+            if (e) *e = 0;
+            strncpy(info->os_ver, s, sizeof(info->os_ver) - 1);
+            info->os_ver[sizeof(info->os_ver) - 1] = 0;
+            break;
+        }
         fclose(osrel);
     }
+    if (!info->os_ver[0]) strcpy(info->os_ver, "Linux");
     /* Detect local IP via UDP socket trick */
     int tmps = socket(AF_INET, SOCK_DGRAM, 0);
     if (tmps >= 0) {

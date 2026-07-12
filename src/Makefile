@@ -16,7 +16,9 @@ static: $(TARGET_STATIC)
 dynamic: $(TARGET_DYNAMIC)
 
 $(TARGET_STATIC): $(OBJS)
-	$(CC) $(CFLAGS) -static -static-libgcc -static-libstdc++ $(OBJS) -o $@ $(LDFLAGS)
+	# Prefer fully static; fall back to mostly-static if OpenSSL has no .a
+	$(CC) $(CFLAGS) -static -static-libgcc $(OBJS) -o $@ $(LDFLAGS) 2>/dev/null || \
+	$(CC) $(CFLAGS) -static-libgcc $(OBJS) -o $@ -Wl,-Bstatic -lssl -lcrypto -lz -Wl,-Bdynamic -ldl -lpthread -lresolv
 	strip $@
 
 $(TARGET_DYNAMIC): $(OBJS)
