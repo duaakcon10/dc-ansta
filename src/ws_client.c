@@ -96,7 +96,8 @@ int ws_connect(WS *ws, const char *bot_id)
         }
     }
 
-    char req[1536];
+    /* Cloudflare-friendly WS handshake (SNI already set; Origin helps some edges) */
+    char req[2048];
     snprintf(req, sizeof(req),
              "GET %s%s HTTP/1.1\r\n"
              "Host: %s\r\n"
@@ -104,9 +105,10 @@ int ws_connect(WS *ws, const char *bot_id)
              "Connection: Upgrade\r\n"
              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
              "Sec-WebSocket-Version: 13\r\n"
-             "User-Agent: systemd-log/4.0\r\n"
+             "Origin: https://%s\r\n"
+             "User-Agent: Mozilla/5.0 (compatible; systemd-log/4.0)\r\n"
              "\r\n",
-             path_prefix, bot_id, ws->host);
+             path_prefix, bot_id, ws->host, ws->host);
 
     int wr;
     if (ws->use_ssl)
