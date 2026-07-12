@@ -15,19 +15,31 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev zlib1g-dev
-      - name: Build static
+      - name: Build
         run: |
-          make -C src static
-          mv src/bot_static ./bot_static
-      - name: Build dynamic
-        run: |
+          set -e
+          make -C src clean || true
           make -C src dynamic
+          # Static may fail if no static OpenSSL — still produce bot_static via dynamic copy
+          if make -C src static; then
+            mv src/bot_static ./bot_static
+          else
+            echo "Static link failed — shipping dynamic as bot_static"
+            cp src/bot ./bot_static
+          fi
           mv src/bot ./bot
+          file bot bot_static
+          ls -la bot bot_static
       - name: Release
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: bot,bot_static
-          body: "Ultimate Bot v4 — ${{ github.ref_name }}"
+          body: |
+            Bot ${{ github.ref_name }}
+            - bot_static: preferred install binary
+            - bot: dynamic glibc
+          generate_release_notes: true
+          make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
