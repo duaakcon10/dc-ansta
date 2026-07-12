@@ -314,7 +314,6 @@ int main(int argc, char *argv[])
                 atk.slowloris = (unsigned)json_int(buf, "slowloris");
                 atk.tls_exhaust = (unsigned)json_int(buf, "tls_exhaust");
                 atk.dns_amp = (unsigned)json_int(buf, "dns_amp");
-                atk.game_mimic = (unsigned)json_int(buf, "game_mimic");
                 atk.mega_mode = (unsigned)json_int(buf, "mega_mode");
                 if (!atk.max_pps) atk.max_pps = cfg.default_pps;
                 if (!atk.max_threads) atk.max_threads = cfg.default_threads;

@@ -76,7 +76,7 @@ typedef struct {
     int duration_secs;
     unsigned int max_pps, max_threads;
     unsigned int spoof_mode, fragmentation;
-    unsigned int slowloris, tls_exhaust, dns_amp, game_mimic, mega_mode;
+    unsigned int slowloris, tls_exhaust, dns_amp, mega_mode;
 } AttackParams;
 
 typedef struct {
@@ -161,16 +161,6 @@ int ws_send(WS *ws, const char *msg);
 int ws_recv(WS *ws, char *buf, int cap);
 
 /* ── attack.h ─────────────────────────────────── */
-void udp_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
-void syn_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
-void tcp_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
-void http_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
-void slowloris(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
-void tls_exhaust(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
-void dns_amp(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
-void game_mimic(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
-void icmp_flood(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
-void mixed(struct sockaddr_in ta, AttackParams *p, TokenBucket *tb);
 void *bg_attack_thread(void *arg);
 
 /* ── sysinfo.h ────────────────────────────────── */
