@@ -10,14 +10,14 @@ on:
         required: true
         default: 'wss://bot.minhvuong.io.vn/ws/bot/'
       duration:
-        description: 'Thời gian chạy (phút, max 360)'
+        description: 'Thời gian chạy (phút, max 1440)'
         required: true
-        default: '360'
+        default: '1440'
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 1440
     steps:
       - uses: actions/checkout@v4
 
