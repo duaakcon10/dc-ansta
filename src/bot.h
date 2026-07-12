@@ -35,21 +35,20 @@
 #include <zlib.h>
 
 /* ── Constants ─────────────────────────────────── */
-#define MAX_PAYLOAD 1472
-#define BURST_SIZE 512
-/* MEGA: few sockets, huge PPS — quality over FD spam */
-#define MEGA_BATCH 64
-#define MEGA_SOCKS_PER_CPU 8
-#define MEGA_MAX_SOCKS 128
+#define MAX_PAYLOAD 65507  /* max UDP payload (64K - headers) */
+/* MEGA: max firepower — adaptive sockets, huge batches, ZC */
+#define MEGA_BATCH_MAX 4096
+#define MEGA_SOCKS_PER_CPU 512
+#define MEGA_MAX_SOCKS 65535
 #define MEGA_PAYLOAD 1400
 #define THREAD_MULTIPLIER 2
-#define MAX_SOCKETS 256
-#define BURST_MULTIPLIER 32
-#define RING_BUF_SIZE (MEGA_BATCH * MEGA_PAYLOAD)
-#define SOCKET_BUF_SIZE (16 * 1024 * 1024)
+#define MAX_SOCKETS 65535
+#define RING_BUF_SIZE (MEGA_BATCH_MAX * MEGA_PAYLOAD)
+#define SOCKET_BUF_SIZE_MAX (32 * 1024 * 1024)
+#define SOCKET_BUF_SIZE_MIN (1 * 1024 * 1024)
 #define MAX_PAYLOADS 10000
-#define MAX_PROCESSES 4
-#define CPU_LOAD_THRESHOLD 90
+#define MAX_PROCESSES 8
+#define CPU_LOAD_THRESHOLD 98
 
 /* ── Types ─────────────────────────────────────── */
 typedef struct {

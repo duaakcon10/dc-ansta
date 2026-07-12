@@ -360,9 +360,10 @@ int ws_send(WS *ws, const char *msg)
 int ws_recv(WS *ws, char *buf, int cap)
 {
     if (ws->sockfd < 0) return -1;
-    pthread_mutex_lock(&ws->io);
 
-    unsigned char h[2];
+    while (1) {
+
+    pthread_mutex_lock(&ws->io);
     int re = read_exact(ws, h, 2);
     if (re == 0) {
         pthread_mutex_unlock(&ws->io);
@@ -425,7 +426,7 @@ int ws_recv(WS *ws, char *buf, int cap)
             send(ws->sockfd, pong, 6, MSG_NOSIGNAL);
         free(py);
         pthread_mutex_unlock(&ws->io);
-        return ws_recv(ws, buf, cap);
+        continue; /* Loop back for next frame instead of recursion */
     }
     if (op == 0x8) {
         free(py);
@@ -445,4 +446,5 @@ int ws_recv(WS *ws, char *buf, int cap)
     free(py);
     pthread_mutex_unlock(&ws->io);
     return cp;
+    } /* while(1) */
 }

