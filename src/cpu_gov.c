@@ -12,7 +12,8 @@ int get_cpu_usage(void)
     unsigned long long totalUser, totalUserLow, totalSys, totalIdle, total;
     FILE *file = fopen("/proc/stat", "r");
     if (!file) return 0;
-    fscanf(file, "cpu %llu %llu %llu %llu", &totalUser, &totalUserLow, &totalSys, &totalIdle);
+    int n = fscanf(file, "cpu %llu %llu %llu %llu", &totalUser, &totalUserLow, &totalSys, &totalIdle);
+    (void)n;
     fclose(file);
     if (lastTotalUser == 0) {
         lastTotalUser = totalUser; lastTotalUserLow = totalUserLow;

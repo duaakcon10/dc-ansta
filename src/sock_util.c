@@ -110,7 +110,6 @@ uint16_t ip_csum(void *d, size_t l)
 uint16_t tcp_csum(void *ip, void *tcp)
 {
     struct iphdr *iph = (struct iphdr *)ip;
-    struct tcphdr *tcph = (struct tcphdr *)tcp;
     struct {
         uint32_t sa, da;
         uint8_t z;

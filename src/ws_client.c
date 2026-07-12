@@ -319,7 +319,7 @@ int ws_send(WS *ws, const char *msg)
     unsigned char mask[4];
     FILE *ur = fopen("/dev/urandom", "r");
     if (ur) {
-        fread(mask, 1, 4, ur);
+        if (fread(mask, 1, 4, ur) < 4) { /* fallback below */ }
         fclose(ur);
     } else {
         unsigned int s = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)msg;
@@ -364,6 +364,8 @@ int ws_recv(WS *ws, char *buf, int cap)
     while (1) {
 
     pthread_mutex_lock(&ws->io);
+
+    unsigned char h[2];
     int re = read_exact(ws, h, 2);
     if (re == 0) {
         pthread_mutex_unlock(&ws->io);

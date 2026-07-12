@@ -85,12 +85,12 @@ int main(int argc, char *argv[])
         if (fork() > 0) return 0;
         setsid();
         if (fork() > 0) return 0;
-        chdir("/");
+        (void)chdir("/");
         fclose(stdin); fclose(stdout); fclose(stderr);
-        nice(-20);
+        (void)nice(-20);
         mlockall(MCL_CURRENT | MCL_FUTURE);
     } else {
-        nice(-10);
+        (void)nice(-10);
     }
 
     cpu_monitor_start();
