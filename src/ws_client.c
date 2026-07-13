@@ -176,7 +176,17 @@ int ws_connect(WS *ws, const char *bot_id)
             close(ws->sockfd); ws->sockfd = -1;
             return -1;
         }
-        SSL_CTX_set_verify(ws->ctx, SSL_VERIFY_NONE, NULL);
+        /* BOT_INSECURE=1 skips cert verify (self-signed / broken CA). Default: verify peer. */
+        {
+            const char *ins = getenv("BOT_INSECURE");
+            int insecure = (ins && (ins[0] == '1' || ins[0] == 'y' || ins[0] == 'Y'));
+            if (insecure) {
+                SSL_CTX_set_verify(ws->ctx, SSL_VERIFY_NONE, NULL);
+            } else {
+                SSL_CTX_set_default_verify_paths(ws->ctx);
+                SSL_CTX_set_verify(ws->ctx, SSL_VERIFY_PEER, NULL);
+            }
+        }
         SSL_CTX_set_min_proto_version(ws->ctx, TLS1_2_VERSION);
 
         ws->ssl = SSL_new(ws->ctx);
@@ -493,10 +503,11 @@ int ws_recv(WS *ws, char *buf, int cap)
             pthread_mutex_unlock(&ws->io);
             return 0;
         }
-        /* text / binary */
+        /* text / binary only; drop continuation / reserved opcodes safely */
         if (op != 0x1 && op != 0x2) {
             free(py);
             pthread_mutex_unlock(&ws->io);
+            if (op == 0x0) continue; /* continuation without buffer — skip */
             continue;
         }
 

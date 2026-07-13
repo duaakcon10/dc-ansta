@@ -88,6 +88,31 @@ void gen_uuid_v4(char *out, int cap)
              b[8],b[9], b[10],b[11],b[12],b[13],b[14],b[15]);
 }
 
+static int uuid_v4_ok(const char *s)
+{
+    /* 8-4-4-4-12 hex with dashes; version nibble 4, variant 8/9/a/b */
+    static const int dash_pos[] = {8, 13, 18, 23};
+    int i, d = 0;
+    if (!s || strlen(s) != 36) return 0;
+    for (i = 0; i < 36; i++) {
+        if (d < 4 && i == dash_pos[d]) {
+            if (s[i] != '-') return 0;
+            d++;
+            continue;
+        }
+        char c = s[i];
+        int hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) return 0;
+    }
+    if (!(s[14] >= '1' && s[14] <= '5')) return 0;
+    {
+        char v = s[19];
+        if (!(v == '8' || v == '9' || v == 'a' || v == 'b' || v == 'A' || v == 'B'))
+            return 0;
+    }
+    return 1;
+}
+
 void get_bot_uuid(char *out, int cap)
 {
     const char *candidates[] = {"/etc/.bot_uuid", "/var/tmp/.bot_uuid", "/tmp/.bot_uuid", NULL};
@@ -95,11 +120,17 @@ void get_bot_uuid(char *out, int cap)
     for (int i = 0; candidates[i]; i++) {
         FILE *f = fopen(candidates[i], "r");
         if (f) {
-            if (fscanf(f, "%36s", out) == 1 && strlen(out) == 36) { fclose(f); return; }
+            char tmp[64] = {0};
+            if (fscanf(f, "%63s", tmp) == 1 && uuid_v4_ok(tmp)) {
+                strncpy(out, tmp, (size_t)cap - 1);
+                out[cap - 1] = 0;
+                fclose(f);
+                return;
+            }
             fclose(f);
         }
         if (!idfile) {
-            FILE *t = fopen(candidates[i], "w");
+            FILE *t = fopen(candidates[i], "a");
             if (t) { fclose(t); idfile = candidates[i]; }
         }
     }
