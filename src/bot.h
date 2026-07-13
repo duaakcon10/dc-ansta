@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/file.h>
+#include <poll.h>
 #include <sys/poll.h>
 #include <sys/resource.h>
 #include <ifaddrs.h>

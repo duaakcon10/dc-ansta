@@ -50,12 +50,13 @@ static int io_read(WS *ws, void *buf, int need)
                 || errno == ETIMEDOUT
 #endif
             )
-                return got;
+                return got > 0 ? got : 0; /* idle / timeout, not hard close */
             return -1;
         }
-        /* Other SSL errors: treat empty as idle once, not instant death */
-        if (got == 0 && (errno == 0 || errno == EAGAIN || errno == EWOULDBLOCK))
+        /* SSL_ERROR_SSL / unexpected: only hard if we have no partial data */
+        if (got == 0 && (errno == 0 || errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
             return 0;
+        if (got > 0) return got;
         return -1;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == 0
@@ -417,10 +418,21 @@ int ws_send(WS *ws, const char *msg)
         packed[hdr_len + 4 + i] = ((const unsigned char *)msg)[i] ^ mask[i % 4];
 
     int r = -1;
-    if (ws->use_ssl)
+    if (ws->use_ssl) {
         r = (ssl_write_all(ws, packed, (int)total) == (int)total) ? (int)total : -1;
-    else
-        r = (int)send(ws->sockfd, packed, total, MSG_NOSIGNAL);
+    } else {
+        size_t sent = 0;
+        while (sent < total) {
+            int n = (int)send(ws->sockfd, packed + sent, total - sent, MSG_NOSIGNAL);
+            if (n <= 0) {
+                if (errno == EINTR) continue;
+                r = -1;
+                break;
+            }
+            sent += (size_t)n;
+        }
+        if (sent == total) r = (int)total;
+    }
 
     free(packed);
     pthread_mutex_unlock(&ws->io);
@@ -491,8 +503,12 @@ int ws_recv(WS *ws, char *buf, int cap)
             pong[1] = (unsigned char)(0x80 | (unsigned)plen);
             unsigned char m[4];
             FILE *ur2 = fopen("/dev/urandom", "r");
-            if (ur2) { fread(m, 1, 4, ur2); fclose(ur2); }
-            else { memset(m, 0xab, 4); }
+            if (ur2) {
+                if (fread(m, 1, 4, ur2) != 4) memset(m, 0xab, 4);
+                fclose(ur2);
+            } else {
+                memset(m, 0xab, 4);
+            }
             memcpy(pong + ph, m, 4);
             ph += 4;
             for (uint64_t i = 0; i < plen; i++)
