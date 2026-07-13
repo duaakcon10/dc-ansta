@@ -28,18 +28,26 @@ static int io_read(WS *ws, void *buf, int need)
     if (ws->use_ssl) {
         int e = SSL_get_error(ws->ssl, n);
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
-            return got;
+            return got; /* wouldblock / SO_RCVTIMEO */
         if (e == SSL_ERROR_ZERO_RETURN)
-            return got > 0 ? got : -1;
+            return got > 0 ? got : -1; /* clean TLS close */
         if (e == SSL_ERROR_SYSCALL) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            /* Timeout or interrupt: errno may be EAGAIN/ETIMEDOUT or 0 (OpenSSL quirk) */
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ||
+#ifdef ETIMEDOUT
+                errno == ETIMEDOUT ||
+#endif
+                errno == 0)
                 return got;
-            /* errno==0 often means unexpected EOF on some systems */
             return -1;
         }
         return -1;
     }
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR
+#ifdef ETIMEDOUT
+        || errno == ETIMEDOUT
+#endif
+        || errno == 0)
         return got;
     return -1;
 }
@@ -176,15 +184,15 @@ int ws_connect(WS *ws, const char *bot_id)
             close(ws->sockfd); ws->sockfd = -1;
             return -1;
         }
-        /* BOT_INSECURE=1 skips cert verify (self-signed / broken CA). Default: verify peer. */
+        /* Default: no verify (C2 often behind CF / custom cert). BOT_VERIFY=1 enables peer check. */
         {
-            const char *ins = getenv("BOT_INSECURE");
-            int insecure = (ins && (ins[0] == '1' || ins[0] == 'y' || ins[0] == 'Y'));
-            if (insecure) {
-                SSL_CTX_set_verify(ws->ctx, SSL_VERIFY_NONE, NULL);
-            } else {
+            const char *ver = getenv("BOT_VERIFY");
+            int verify = (ver && (ver[0] == '1' || ver[0] == 'y' || ver[0] == 'Y'));
+            if (verify) {
                 SSL_CTX_set_default_verify_paths(ws->ctx);
                 SSL_CTX_set_verify(ws->ctx, SSL_VERIFY_PEER, NULL);
+            } else {
+                SSL_CTX_set_verify(ws->ctx, SSL_VERIFY_NONE, NULL);
             }
         }
         SSL_CTX_set_min_proto_version(ws->ctx, TLS1_2_VERSION);

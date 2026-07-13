@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.22"
+#define BOT_VERSION_TAG "v4.0.23"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -309,7 +309,11 @@ int main(int argc, char *argv[])
             if (n < 0) {
                 recv_fail++;
                 if (foreground) fprintf(stderr, "[bot] recv hard error #%d\n", recv_fail);
-                /* One hard error is enough: peer closed / SSL desync / close frame */
+                /* Tolerate brief glitches (CF/Caddy); reconnect after 3 hard fails */
+                if (recv_fail < 3) {
+                    usleep(100000);
+                    continue;
+                }
                 break;
             }
             last_recv = time(NULL);
