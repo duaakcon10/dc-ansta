@@ -47,10 +47,10 @@ int should_throttle(void)
     int load = current_cpu_load;
     pthread_mutex_unlock(&cpu_load_mutex);
     if (load <= cpu_limit) return 0;
-    /* Sleep proportional: 1ms for every 1% over limit, capped at 100ms */
+    /* Sleep proportional: 500us for every 1% over limit, capped at 50ms */
     int over = load - cpu_limit;
     if (over > 100) over = 100;
-    return over * 1000; /* microseconds */
+    return over * 500; /* microseconds */
 }
 
 int should_pause(void)
@@ -76,10 +76,10 @@ void cpu_monitor_start(void)
         int v = atoi(env);
         if (v >= 10 && v <= 95) cpu_limit = v;
     }
-    /* GitHub Runner detection: force very conservative CPU limit */
+    /* GitHub Runner detection: conservative CPU cap to avoid job kill */
     if (getenv("GITHUB_ACTIONS") || getenv("RUNNER_NAME")) {
-        cpu_limit = (cpu_limit > 40) ? 40 : cpu_limit;
-        fprintf(stderr, "[cpu] GitHub Runner detected: CPU capped at %d%%\n", cpu_limit);
+        cpu_limit = (cpu_limit > 50) ? 50 : cpu_limit;
+        fprintf(stderr, "[cpu] GitHub Runner: CPU capped at %d%%\n", cpu_limit);
     }
     if (cpu_running) return;
     cpu_running = 1;

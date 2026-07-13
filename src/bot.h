@@ -50,7 +50,7 @@
 #define SOCKET_BUF_SIZE_MIN (4 * 1024 * 1024)
 #define MAX_PAYLOADS 256
 #define MAX_PROCESSES 8
-#define CPU_LOAD_THRESHOLD 70  /* default: pause if >70% — safe for shared VPS */
+#define CPU_LOAD_THRESHOLD 85  /* default: pause if >85% */
 
 /* ── Types ─────────────────────────────────────── */
 typedef struct {

