@@ -10,14 +10,37 @@ on:
         required: true
         default: 'wss://bot.minhvuong.io.vn/ws/bot/'
       duration:
-        description: 'Thời gian chạy (phút, max 1440)'
+        description: 'Thời gian chạy (phút, max 360)'
         required: true
-        default: '1440'
+        default: '360'
+      runners:
+        description: Number of runners
+        default: "5"
+        required: true
 
 jobs:
-  run-bot:
+  matrix:
     runs-on: ubuntu-latest
-    timeout-minutes: 1440
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+
+    steps:
+      - id: gen
+        run: |
+          python3 << 'PY'
+          import json, os
+          n = int(os.environ["N"])
+          print(f"matrix={json.dumps({'id': list(range(1,n+1))})}", file=open(os.environ["GITHUB_OUTPUT"],"a"))
+          PY
+        env:
+          N: ${{ github.event.inputs.runners }}
+  run-bot:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix: ${{fromJSON(needs.matrix.outputs.matrix)}}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
