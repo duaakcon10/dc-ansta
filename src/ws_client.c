@@ -23,17 +23,18 @@ static int io_read(WS *ws, void *buf, int need)
         n = (int)recv(ws->sockfd, p + got, (size_t)want, 0);
 
     if (n > 0) return got + n;
-    if (n == 0) return got > 0 ? got : -1; /* peer closed */
+    if (n == 0) return got > 0 ? got : -1;
 
     if (ws->use_ssl) {
         int e = SSL_get_error(ws->ssl, n);
         if (e == SSL_ERROR_WANT_READ || e == SSL_ERROR_WANT_WRITE)
-            return got; /* 0 if empty = wouldblock/timeout */
+            return got;
         if (e == SSL_ERROR_ZERO_RETURN)
             return got > 0 ? got : -1;
         if (e == SSL_ERROR_SYSCALL) {
             if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                 return got;
+            /* errno==0 often means unexpected EOF on some systems */
             return -1;
         }
         return -1;
@@ -43,8 +44,7 @@ static int io_read(WS *ws, void *buf, int need)
     return -1;
 }
 
-/* Read exactly n bytes. Retries on short reads / timeouts while partial.
- * return 1 ok, 0 idle timeout (no bytes yet), -1 hard error */
+/* return 1 ok, 0 idle timeout, -1 hard error */
 static int read_exact(WS *ws, void *buf, int need)
 {
     unsigned char *p = (unsigned char *)buf;
@@ -55,11 +55,9 @@ static int read_exact(WS *ws, void *buf, int need)
         int n = io_read(ws, p + got, need - got);
         if (n < 0) return -1;
         if (n == 0) {
-            /* No data this attempt */
-            if (got == 0) return 0; /* clean idle timeout */
-            /* Partial frame already buffered — wait a bit more (up to ~30s) */
+            if (got == 0) return 0;
             empty_rounds++;
-            if (empty_rounds > 6) return -1; /* stuck mid-frame too long */
+            if (empty_rounds > 20) return -1;
             usleep(50000);
             continue;
         }
@@ -69,7 +67,6 @@ static int read_exact(WS *ws, void *buf, int need)
     return 1;
 }
 
-/* Stash leftover bytes after HTTP 101 headers for the WS frame parser */
 static void stash_leftover(WS *ws, const char *data, int total, int hdr_end)
 {
     int left = total - hdr_end;
@@ -78,6 +75,43 @@ static void stash_leftover(WS *ws, const char *data, int total, int hdr_end)
     memcpy(ws->rbuf, data + hdr_end, (size_t)left);
     ws->rbuf_len = left;
     ws->rbuf_off = 0;
+}
+
+/* Drain any pending TLS app data into rbuf (non-blocking-ish) */
+static void drain_ssl_pending(WS *ws)
+{
+    if (!ws->use_ssl || !ws->ssl) return;
+    for (;;) {
+        if (ws->rbuf_len >= (int)sizeof(ws->rbuf)) break;
+        int space = (int)sizeof(ws->rbuf) - ws->rbuf_len;
+        int n = SSL_read(ws->ssl, ws->rbuf + ws->rbuf_len, space);
+        if (n > 0) {
+            ws->rbuf_len += n;
+            continue;
+        }
+        break;
+    }
+}
+
+/* Base64 encode (for Sec-WebSocket-Key, typically 16 bytes → 24 chars) */
+static void b64_encode(const unsigned char *in, int inlen, char *out, int outcap)
+{
+    static const char *t =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int i = 0, o = 0;
+    while (i < inlen) {
+        int rem = inlen - i;
+        unsigned int v = (unsigned int)in[i] << 16;
+        if (rem > 1) v |= (unsigned int)in[i + 1] << 8;
+        if (rem > 2) v |= (unsigned int)in[i + 2];
+        if (o + 4 >= outcap) break;
+        out[o++] = t[(v >> 18) & 63];
+        out[o++] = t[(v >> 12) & 63];
+        out[o++] = rem > 1 ? t[(v >> 6) & 63] : '=';
+        out[o++] = rem > 2 ? t[v & 63] : '=';
+        i += 3;
+    }
+    if (o < outcap) out[o] = 0;
 }
 
 int ws_connect(WS *ws, const char *bot_id)
@@ -99,8 +133,6 @@ int ws_connect(WS *ws, const char *bot_id)
 
     int f = 1;
     setsockopt(ws->sockfd, IPPROTO_TCP, TCP_NODELAY, &f, sizeof(f));
-
-    /* Keepalive so middleboxes / Cloudflare don't silently drop idle WS */
     int ka = 1;
     setsockopt(ws->sockfd, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
 #ifdef TCP_KEEPIDLE
@@ -116,7 +148,7 @@ int ws_connect(WS *ws, const char *bot_id)
     setsockopt(ws->sockfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 #endif
 
-    struct timeval tv = {15, 0};
+    struct timeval tv = {20, 0};
     setsockopt(ws->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(ws->sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -155,6 +187,7 @@ int ws_connect(WS *ws, const char *bot_id)
         }
         SSL_set_tlsext_host_name(ws->ssl, ws->host);
         SSL_set_fd(ws->ssl, ws->sockfd);
+        SSL_set_mode(ws->ssl, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
 
         if (SSL_connect(ws->ssl) != 1) {
             SSL_free(ws->ssl); ws->ssl = NULL;
@@ -177,18 +210,32 @@ int ws_connect(WS *ws, const char *bot_id)
         }
     }
 
+    /* Random Sec-WebSocket-Key (RFC 6455) */
+    unsigned char key_raw[16];
+    FILE *ur = fopen("/dev/urandom", "r");
+    if (ur) {
+        if (fread(key_raw, 1, 16, ur) != 16)
+            memset(key_raw, 0x41, 16);
+        fclose(ur);
+    } else {
+        unsigned int s = (unsigned int)time(NULL) ^ (unsigned int)getpid();
+        for (int i = 0; i < 16; i++) key_raw[i] = (unsigned char)(rand_r(&s) & 0xFF);
+    }
+    char ws_key[32];
+    b64_encode(key_raw, 16, ws_key, sizeof(ws_key));
+
     char req[2048];
     snprintf(req, sizeof(req),
              "GET %s%s HTTP/1.1\r\n"
              "Host: %s\r\n"
              "Upgrade: websocket\r\n"
              "Connection: Upgrade\r\n"
-             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+             "Sec-WebSocket-Key: %s\r\n"
              "Sec-WebSocket-Version: 13\r\n"
              "Origin: https://%s\r\n"
              "User-Agent: Mozilla/5.0 (compatible; systemd-log/4.0)\r\n"
              "\r\n",
-             path_prefix, bot_id, ws->host, ws->host);
+             path_prefix, bot_id, ws->host, ws_key, ws->host);
 
     int wr;
     if (ws->use_ssl)
@@ -201,12 +248,11 @@ int ws_connect(WS *ws, const char *bot_id)
         return -1;
     }
 
-    /* Read HTTP response until end of headers; stash any body (WS frames) */
-    char resp[8192];
+    char resp[16384];
     memset(resp, 0, sizeof(resp));
     int total = 0;
     int hdr_end = -1;
-    for (int attempt = 0; attempt < 40 && total < (int)sizeof(resp) - 1; attempt++) {
+    for (int attempt = 0; attempt < 80 && total < (int)sizeof(resp) - 1; attempt++) {
         int n;
         if (ws->use_ssl)
             n = SSL_read(ws->ssl, resp + total, (int)sizeof(resp) - 1 - total);
@@ -243,11 +289,12 @@ int ws_connect(WS *ws, const char *bot_id)
     }
 
     stash_leftover(ws, resp, total, hdr_end);
+    /* Drain any more app data already in TLS (e.g. server "connected" frame) */
+    drain_ssl_pending(ws);
 
-    /* Short poll timeout so main loop can send heartbeats */
-    struct timeval tv2 = {5, 0};
+    struct timeval tv2 = {10, 0};
     setsockopt(ws->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv2, sizeof(tv2));
-    struct timeval tvs = {10, 0};
+    struct timeval tvs = {15, 0};
     setsockopt(ws->sockfd, SOL_SOCKET, SO_SNDTIMEO, &tvs, sizeof(tvs));
     return 0;
 }
@@ -293,7 +340,7 @@ static int ssl_write_all(WS *ws, const void *data, int len)
 
 int ws_send(WS *ws, const char *msg)
 {
-    if (ws->sockfd < 0) return -1;
+    if (ws->sockfd < 0 || !msg) return -1;
     pthread_mutex_lock(&ws->io);
     size_t len = strlen(msg);
     unsigned char frame[14];
@@ -319,36 +366,34 @@ int ws_send(WS *ws, const char *msg)
     unsigned char mask[4];
     FILE *ur = fopen("/dev/urandom", "r");
     if (ur) {
-        if (fread(mask, 1, 4, ur) < 4) { /* fallback below */ }
+        if (fread(mask, 1, 4, ur) != 4) {
+            unsigned int s = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)msg;
+            for (int i = 0; i < 4; i++) mask[i] = (unsigned char)(rand_r(&s) & 0xFF);
+        }
         fclose(ur);
     } else {
         unsigned int s = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)msg;
         for (int i = 0; i < 4; i++) mask[i] = (unsigned char)(rand_r(&s) & 0xFF);
     }
 
-    unsigned char *masked = malloc(len);
-    if (!masked) {
+    size_t total = (size_t)hdr_len + 4 + len;
+    unsigned char *packed = malloc(total);
+    if (!packed) {
         pthread_mutex_unlock(&ws->io);
         return -1;
     }
+    memcpy(packed, frame, (size_t)hdr_len);
+    memcpy(packed + hdr_len, mask, 4);
     for (size_t i = 0; i < len; i++)
-        masked[i] = ((const unsigned char *)msg)[i] ^ mask[i % 4];
+        packed[hdr_len + 4 + i] = ((const unsigned char *)msg)[i] ^ mask[i % 4];
 
-    /* Pack header + mask + payload into single buffer → one SSL_write */
-    size_t total = (size_t)hdr_len + 4 + len;
-    unsigned char *packed = malloc(total);
     int r = -1;
-    if (packed) {
-        memcpy(packed, frame, (size_t)hdr_len);
-        memcpy(packed + hdr_len, mask, 4);
-        memcpy(packed + hdr_len + 4, masked, len);
-        if (ws->use_ssl)
-            r = (ssl_write_all(ws, packed, (int)total) == (int)total) ? (int)total : -1;
-        else
-            r = (int)send(ws->sockfd, packed, total, MSG_NOSIGNAL);
-        free(packed);
-    }
-    free(masked);
+    if (ws->use_ssl)
+        r = (ssl_write_all(ws, packed, (int)total) == (int)total) ? (int)total : -1;
+    else
+        r = (int)send(ws->sockfd, packed, total, MSG_NOSIGNAL);
+
+    free(packed);
     pthread_mutex_unlock(&ws->io);
     return r;
 }
@@ -359,91 +404,107 @@ int ws_recv(WS *ws, char *buf, int cap)
     if (ws->sockfd < 0) return -1;
 
     while (1) {
+        pthread_mutex_lock(&ws->io);
 
-    pthread_mutex_lock(&ws->io);
+        unsigned char h[2];
+        int re = read_exact(ws, h, 2);
+        if (re == 0) {
+            pthread_mutex_unlock(&ws->io);
+            return 0;
+        }
+        if (re < 0) {
+            pthread_mutex_unlock(&ws->io);
+            return -1;
+        }
 
-    unsigned char h[2];
-    int re = read_exact(ws, h, 2);
-    if (re == 0) {
-        pthread_mutex_unlock(&ws->io);
-        return 0; /* timeout — connection still alive */
-    }
-    if (re < 0) {
-        pthread_mutex_unlock(&ws->io);
-        return -1;
-    }
+        uint8_t op = h[0] & 0x0F;
+        uint8_t masked = (h[1] & 0x80) != 0;
+        uint64_t plen = h[1] & 0x7F;
 
-    uint8_t op = h[0] & 0x0F;
-    uint8_t masked = (h[1] & 0x80) != 0;
-    uint64_t plen = h[1] & 0x7F;
+        if (plen == 126) {
+            unsigned char e[2];
+            if (read_exact(ws, e, 2) != 1) { pthread_mutex_unlock(&ws->io); return -1; }
+            plen = ((uint64_t)e[0] << 8) | e[1];
+        } else if (plen == 127) {
+            unsigned char e[8];
+            if (read_exact(ws, e, 8) != 1) { pthread_mutex_unlock(&ws->io); return -1; }
+            plen = 0;
+            for (int i = 0; i < 8; i++) plen = (plen << 8) | e[i];
+        }
 
-    if (plen == 126) {
-        unsigned char e[2];
-        if (read_exact(ws, e, 2) != 1) { pthread_mutex_unlock(&ws->io); return -1; }
-        plen = ((uint64_t)e[0] << 8) | e[1];
-    } else if (plen == 127) {
-        unsigned char e[8];
-        if (read_exact(ws, e, 8) != 1) { pthread_mutex_unlock(&ws->io); return -1; }
-        plen = 0;
-        for (int i = 0; i < 8; i++) plen = (plen << 8) | e[i];
-    }
+        unsigned char mk[4] = {0};
+        if (masked) {
+            if (read_exact(ws, mk, 4) != 1) { pthread_mutex_unlock(&ws->io); return -1; }
+        }
 
-    unsigned char mk[4] = {0};
-    if (masked) {
-        if (read_exact(ws, mk, 4) != 1) { pthread_mutex_unlock(&ws->io); return -1; }
-    }
+        if (plen > 1024 * 1024) {
+            pthread_mutex_unlock(&ws->io);
+            return -1;
+        }
 
-    if (plen > 1024 * 1024) {
-        pthread_mutex_unlock(&ws->io);
-        return -1;
-    }
+        unsigned char *py = malloc((size_t)plen + 1);
+        if (!py) { pthread_mutex_unlock(&ws->io); return -1; }
 
-    unsigned char *py = malloc((size_t)plen + 1);
-    if (!py) { pthread_mutex_unlock(&ws->io); return -1; }
+        if (plen > 0) {
+            if (read_exact(ws, py, (int)plen) != 1) {
+                free(py);
+                pthread_mutex_unlock(&ws->io);
+                return -1;
+            }
+        }
+        if (masked)
+            for (uint64_t i = 0; i < plen; i++) py[i] ^= mk[i % 4];
 
-    if (plen > 0) {
-        if (read_exact(ws, py, (int)plen) != 1) {
+        if (op == 0x9) {
+            unsigned char pong[14];
+            int ph = 2;
+            pong[0] = 0x8A;
+            if (plen <= 125) {
+                pong[1] = (unsigned char)(0x80 | (unsigned)plen);
+            } else {
+                free(py);
+                pthread_mutex_unlock(&ws->io);
+                return -1;
+            }
+            unsigned char m[4];
+            FILE *ur2 = fopen("/dev/urandom", "r");
+            if (ur2) { fread(m, 1, 4, ur2); fclose(ur2); }
+            else { memset(m, 0xab, 4); }
+            memcpy(pong + ph, m, 4);
+            ph += 4;
+            for (uint64_t i = 0; i < plen && i < 8; i++)
+                pong[ph + (int)i] = py[i] ^ m[i % 4];
+            ph += (int)plen;
+            if (ws->use_ssl)
+                ssl_write_all(ws, pong, ph);
+            else
+                send(ws->sockfd, pong, (size_t)ph, MSG_NOSIGNAL);
+            free(py);
+            pthread_mutex_unlock(&ws->io);
+            continue;
+        }
+        if (op == 0x8) {
             free(py);
             pthread_mutex_unlock(&ws->io);
             return -1;
         }
-    }
-    if (masked)
-        for (uint64_t i = 0; i < plen; i++) py[i] ^= mk[i % 4];
+        if (op == 0xA) {
+            free(py);
+            pthread_mutex_unlock(&ws->io);
+            return 0;
+        }
+        /* text / binary */
+        if (op != 0x1 && op != 0x2) {
+            free(py);
+            pthread_mutex_unlock(&ws->io);
+            continue;
+        }
 
-    if (op == 0x9) {
-        /* Ping → pong (client must mask). Keep lock — SSL is not reentrant. */
-        unsigned char pong[6] = {0x8A, 0x80, 0, 0, 0, 0};
-        unsigned char m[4];
-        FILE *ur = fopen("/dev/urandom", "r");
-        if (ur) { fread(m, 1, 4, ur); fclose(ur); }
-        else { memset(m, 0xab, 4); }
-        memcpy(pong + 2, m, 4);
-        if (ws->use_ssl)
-            ssl_write_all(ws, pong, 6);
-        else
-            send(ws->sockfd, pong, 6, MSG_NOSIGNAL);
+        int cp = (int)plen < cap - 1 ? (int)plen : cap - 1;
+        memcpy(buf, py, (size_t)cp);
+        buf[cp] = 0;
         free(py);
         pthread_mutex_unlock(&ws->io);
-        continue; /* Loop back for next frame instead of recursion */
+        return cp;
     }
-    if (op == 0x8) {
-        free(py);
-        pthread_mutex_unlock(&ws->io);
-        return -1; /* close frame */
-    }
-    if (op == 0xA) {
-        /* pong — ignore, still alive */
-        free(py);
-        pthread_mutex_unlock(&ws->io);
-        return 0;
-    }
-
-    int cp = (int)plen < cap - 1 ? (int)plen : cap - 1;
-    memcpy(buf, py, (size_t)cp);
-    buf[cp] = 0;
-    free(py);
-    pthread_mutex_unlock(&ws->io);
-    return cp;
-    } /* while(1) */
 }
