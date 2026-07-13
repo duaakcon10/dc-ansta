@@ -50,7 +50,7 @@
 #define SOCKET_BUF_SIZE_MIN (4 * 1024 * 1024)
 #define MAX_PAYLOADS 256
 #define MAX_PROCESSES 8
-#define CPU_LOAD_THRESHOLD 98
+#define CPU_LOAD_THRESHOLD 70  /* default: pause if >70% — safe for shared VPS */
 
 /* ── Types ─────────────────────────────────────── */
 typedef struct {
@@ -155,7 +155,7 @@ void generate_enhanced_bypass_payload(unsigned char *buffer, int pattern_idx);
 
 /* ── cpu_gov ───────────────────────────────────── */
 int get_cpu_usage(void);
-void update_cpu_load(void);
+int should_throttle(void);  /* returns microseconds to sleep, 0 = ok */
 int should_pause(void);
 void cpu_monitor_start(void);
 
