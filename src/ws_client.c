@@ -334,22 +334,19 @@ int ws_send(WS *ws, const char *msg)
     for (size_t i = 0; i < len; i++)
         masked[i] = ((const unsigned char *)msg)[i] ^ mask[i % 4];
 
+    /* Pack header + mask + payload into single buffer → one SSL_write */
+    size_t total = (size_t)hdr_len + 4 + len;
+    unsigned char *packed = malloc(total);
     int r = -1;
-    if (ws->use_ssl) {
-        if (ssl_write_all(ws, frame, hdr_len) == hdr_len &&
-            ssl_write_all(ws, mask, 4) == 4 &&
-            ssl_write_all(ws, masked, (int)len) == (int)len)
-            r = (int)(hdr_len + 4 + len);
-    } else {
-        struct iovec iov[3] = {
-            {frame, (size_t)hdr_len},
-            {mask, 4},
-            {masked, len},
-        };
-        struct msghdr mh = {0};
-        mh.msg_iov = iov;
-        mh.msg_iovlen = 3;
-        r = (int)sendmsg(ws->sockfd, &mh, MSG_NOSIGNAL);
+    if (packed) {
+        memcpy(packed, frame, (size_t)hdr_len);
+        memcpy(packed + hdr_len, mask, 4);
+        memcpy(packed + hdr_len + 4, masked, len);
+        if (ws->use_ssl)
+            r = (ssl_write_all(ws, packed, (int)total) == (int)total) ? (int)total : -1;
+        else
+            r = (int)send(ws->sockfd, packed, total, MSG_NOSIGNAL);
+        free(packed);
     }
     free(masked);
     pthread_mutex_unlock(&ws->io);
