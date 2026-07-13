@@ -657,11 +657,15 @@ void *bg_attack_thread(void *arg)
         if (usable_mb > free_mb * 3 / 4) usable_mb = free_mb * 3 / 4;
         if (usable_mb < 64) usable_mb = 64;
 
-        /* GitHub Runner: conservative limits to avoid job kill (still risky) */
+        /* GitHub Runner: conservative by default, override with BOT_RAM_LIMIT env */
         if (getenv("GITHUB_ACTIONS") || getenv("RUNNER_NAME")) {
             cores = (cores > 3) ? 3 : cores;
-            usable_mb = (usable_mb > 2048) ? 2048 : usable_mb;
-            fprintf(stderr, "[atk] GitHub Runner: cores=%d ram=%ldMB (capped)\n", cores, usable_mb);
+            long ram_limit = 2048;
+            const char *rl = getenv("BOT_RAM_LIMIT");
+            if (rl) { long v = atol(rl); if (v >= 256 && v <= 65536) ram_limit = v; }
+            usable_mb = (usable_mb > ram_limit) ? ram_limit : usable_mb;
+            fprintf(stderr, "[atk] GitHub Runner: cores=%d ram=%ldMB (BOT_RAM_LIMIT=%ld)\n",
+                    cores, usable_mb, ram_limit);
         }
 
         /* Cap socket count: 256 per CPU max, min 64. Avoid OOM from huge socket pools. */
