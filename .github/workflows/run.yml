@@ -27,7 +27,7 @@ jobs:
           python3 << 'PY'
           import json, os
           n = int(os.environ.get("N") or "1")
-          n = max(1, min(n, 10))
+          n = max(1, min(n, 20))
           m = json.dumps({"id": list(range(1, n + 1))})
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"matrix={m}\n")
@@ -42,7 +42,7 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.matrix.outputs.matrix) }}
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v4
 
