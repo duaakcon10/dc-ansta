@@ -124,3 +124,21 @@ uint16_t tcp_csum(void *ip, void *tcp)
     while (a >> 16) a = (a & 0xFFFF) + (a >> 16);
     return ~a;
 }
+
+uint16_t udp_csum(void *ip, void *udp, void *payload, int pay_len)
+{
+    struct iphdr *iph = (struct iphdr *)ip;
+    struct udphdr *uh = (struct udphdr *)udp;
+    struct { uint32_t sa, da; uint8_t z, pr; uint16_t len; }
+        ps = {iph->saddr, iph->daddr, 0, IPPROTO_UDP, uh->len};
+    uint32_t a = 0;
+    uint16_t *p = (uint16_t *)&ps;
+    for (size_t i = 0; i < sizeof(ps) / 2; i++) a += p[i];
+    p = (uint16_t *)udp;
+    for (size_t i = 0; i < sizeof(struct udphdr) / 2; i++) a += p[i];
+    p = (uint16_t *)payload;
+    for (int i = 0; i < pay_len / 2; i++) a += p[i];
+    if (pay_len & 1) a += ((uint8_t *)payload)[pay_len - 1] << 8;
+    while (a >> 16) a = (a & 0xFFFF) + (a >> 16);
+    return (uint16_t)~a;
+}

