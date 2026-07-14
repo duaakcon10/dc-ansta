@@ -77,7 +77,7 @@ typedef struct {
     int duration_secs;
     unsigned int max_pps, max_threads;
     unsigned int spoof_mode, fragmentation;
-    unsigned int slowloris, tls_exhaust, dns_amp, mega_mode;
+    unsigned int slowloris, tls_exhaust, mega_mode;
     char payload_b64[8192];     /* base64 game payload from server */
     char proxies[16384];        /* proxy list "ip:port\nip:port..." */
 } AttackParams;

