@@ -82,3 +82,29 @@ void json_str(const char *msg, const char *key, char *out, int cap)
     }
     out[len] = 0;
 }
+
+/* Parse a JSON array of integers: "[1,2,3,80,443]" → fills out[] up to cap.
+ * Returns count parsed. Skips non-integer tokens. */
+int json_int_array(const char *msg, const char *key, int *out, int cap)
+{
+    const char *p = find_key(msg, key);
+    if (!p) return 0;
+    p++; /* skip ':' */
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '[') return 0;
+    p++; /* skip '[' */
+    int n = 0;
+    while (*p && *p != ']' && n < cap) {
+        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == ']' || !*p) break;
+        /* parse integer */
+        if (*p < '0' || *p > '9') { p++; continue; } /* skip non-digit */
+        int v = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + (*p - '0');
+            p++;
+        }
+        if (v > 0 && v < 65536) out[n++] = v;
+    }
+    return n;
+}

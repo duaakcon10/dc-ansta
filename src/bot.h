@@ -87,6 +87,9 @@ typedef struct {
     unsigned int slowloris, tls_exhaust, mega_mode;
     char payload_b64[8192];     /* base64 game payload from server */
     char proxies[16384];        /* proxy list "ip:port\nip:port..." */
+    /* Comma-separated open ports from C2 scan, e.g. "80,443,3389,1433".
+     * Empty → bot only hits `port` (default, no multi-port). */
+    char open_ports[4096];
 } AttackParams;
 
 typedef struct {

