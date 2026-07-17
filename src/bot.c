@@ -10,7 +10,7 @@ char g_bot_uuid[64] = {0};
 char g_cur_task_id[64] = {0};
 
 /* Must match GitHub release tag style for auto-update compare */
-#define BOT_VERSION_TAG "v4.0.74"
+#define BOT_VERSION_TAG "v4.0.76"
 
 static void sig_handler(int sig) { (void)sig; g_shutdown = 1; }
 

